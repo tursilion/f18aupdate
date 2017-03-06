@@ -1,0 +1,85 @@
+5		opcode / status
+6		buffer
+7		record len / size read
+8		record number
+9		offset / name len
+
+Interface:
+2800	jmp
+2802	key
+2804	result
+2806	DSRLNK
+2808	checksum (calc)
+280a	checksum (provided)
+
+
+----------------------------------------------------------------
+
+1) build F18A_PureGPU.a99 with WinAsm994a (etc) and generate uncompressed object file F18A_PureGPU.obj
+2) Run tiobj2bin.exe on F18A_PureGPU.obj to get raw binary file F18A_PureGPU.bin
+3) Run bin2inc.exe on F18A_PureGPU.bin to get a TI-formatted asm include file
+4) Copy and paste the include file overtop of the data at the end of F18A_PureLDR.a99
+5) Verify the FILE2S and FILE3S offsets at the top of the file. (You might not have them till the pack step, in which case you can double back)
+6) Build F18A_PureLDR.a99 and create cartridge file F18A_PureLDRC.bin
+7) Run packdatacart to finish the process:
+packdatacart.exe F18A_GUpdate8.bin F18A_PureLDRC.bin f18a_250k_v18.bit f18a_rom_data.bin
+8) Verify that the offsets given match the ones verified in step 5, otherwise go back to step 5, update and rebuild.
+
+
+
+----------------------------------------------------------------
+
+
+ * GPU result (0=Working, 1=OK, 2=Error)
+ 
+DSRLNK Commands:
+ OPEN (0)
+ READ (2) 
+ CLOSE (1)
+ 
+Data reads are always Fixed, Internal, Input, Sequential, 128 bytes per record
+Filename is always 12 bytes long and starts with "DSK1."
+-it's either F18ABIN (166k bitstream) or F18AROM (46k ROM)
+ 
+When value is set to non-zero host should:
+1) execute the PAB file request
+2) update the PAB as needed (record #, error code, # bytes read)
+3) Restart the GPU (without changing the address - GPU just went IDLE)
+ 
+Error code 5 checked for (end of file)
+					 7 (file not found)
+					 	
+					 	
+PAB Read:
+
+The PAB structure in VDP RAM looks like this:
+Byte	Meaning
+0			Opcode (as above, only OPEN(0), CLOSE(1) and READ(2) are used in the updater)
+1			Status- bitmasked. 0xE0 used for error, 0x10 for variable, 0x08 for internal, 0x06 for mode, 0x01 for relative
+			Updater will only request 0x0C - Input, Fixed, Internal, Sequential
+2,3		Address of buffer in VDP RAM (should honor this, big endian)
+4			Record length (Updater will only use 128)
+5			bytes read (make sure to write back 128 after read)
+6-7		Record number (big endian, increment this after each read)
+8			screen offset (updater will only use 0, usually ignored anyway)
+9			Name length (Updater will always have 12)
+10-?	Device name (not terminated). Updater will always pass DSK1.F18ABIN or DSK1.F18AROM
+
+
+-the record to read is taken from RecordNumber (bytes 6 and 7, big endian)
+-After read, the RecordNumber is incremented
+-The number of bytes read (even though it's fixed) is written back to byte 5
+-any error is written to byte 1 (it does NOT need to be cleared on success)
+-Error should be ORd into the three most significant bits
+-Errors recognized are:
+		WRITEPROTECT	1
+		BADATTRIBUTE	2
+		ILLEGALOP			3
+		BUFFERFULL		4
+		READPASTEOF		5
+		DEVICEERROR		6
+		FILEERROR			7
+-Only read past EOF is needed in the updater, and it's considered acceptable if all blocks were read.
+-The code will survive without EOF, but it will read a few extra blocks at the end of each file
+-all other errors will cause the code to be reported and the updater to stop
+

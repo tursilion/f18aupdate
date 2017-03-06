@@ -1,0 +1,5 @@
+*.bin
+*.lst
+*.obj
+CRC.jar
+CRC/*

@@ -1,0 +1,1638 @@
+* F18A In-System Updater on GPU
+* This version runs entirely on the GPU
+* except for the file access, which is
+* intended to make porting to other systems
+* easier - just a loader and file access
+* functions need be implemented.
+* Feb 2017 by Tursi, based on:
+*
+* F18A In-System Updater
+* TI-99/4A with CF7
+*
+* @author Matthew Hagerty
+* @author Rasmus (lastname?)
+* @date July 2014
+* @version 1.6.2
+*
+* To update the updater:
+* Run CRC.jar on .bin bitstream
+* Copy CRC data into this file
+* Compile to TIDisk as F18AUPD
+* Convert .bin bitstream to TI-File (tools->convert PC to TI file) F18ABIN, INT/FIX, 128, Binary
+* Copy F18ABIN to CF7 disk image
+* Copy F18AUPD to CF7 disk image
+* Copy CF7 disk image to CFcard
+*
+* When done beta testing, run in Classic99 to get the CHKSUM value and uncomment
+* the checksum test for final distribution.
+*
+* Checksum values for each revision:
+* 9B68 V1.5 Release
+* 58AD V1.63 Stable - new NT2, prior to blitter update
+* CEBE V1.64 Stable
+* 6623 V1.65 Stable
+* D555 V1.66 Stable
+* E475 V1.67 Stable
+* 4F34 V1.68 Stable
+* 56A4 V1.69 Stable
+* D7AE V1.691 Stable
+* 12FF V1.692 Stable
+* 40CC V1.6 Release
+* A3B5 V1.7 Release
+* F981 V1.8 Release
+* 6355 v1.8 PureGPU Release
+
+*      Configuration
+*      See also section at end of file
+FILE1S EQU  166                 * Size of file 1 (KB)
+FILE2S EQU  46                  * Size of file 2 (KB)
+BLKSIZ EQU  2                   * Read block size (KB)
+FRMVER EQU  >0108               * Firmware version
+GPUPRG EQU  >2800               * GPU program start
+
+*      Constants
+PGITOT EQU  FILE1S+FILE2S/BLKSIZ
+PGIW   EQU  8*30                * Progress indicator width (pixels)
+
+*      VDP Memory Map
+NAMETB EQU  >0000               * Name table
+COLRTB EQU  >0380               * Color table
+PTRNTB EQU  >0800               * Pattern table
+SPRATB EQU  >0300               * Sprite attribute table
+SPRPTB EQU  >0800               * Sprite pattern table
+PAB    EQU  >0F00               * Peripheral address block
+PABBUF EQU  >1000               * File data buffer
+
+*      GPU Equates
+CSON   EQU  >03A0               * SPI chip select enable
+CSOFF  EQU  >03C0               * SPI chip select disable
+
+CMD_RD EQU  >0B00               * Fast Read
+CMD_RS EQU  >0500               * Read Status Register
+CMD_WE EQU  >0600               * Write Enable
+CMD_PP EQU  >0200               * Page Program
+CMD_SE EQU  >D800               * Sector Erase
+
+
+*      Start address of update code - this part used to be CPU code
+       AORG GPUPRG
+       JMP START                * jump over the data
+
+* F18A to host interface
+KEY    DATA >FFFF               * byte input from host of current key (>FF if none)
+RESULT DATA >0000               * error code, 0 = no error
+DSRLNK DATA >0000               * PAB adr to start DSRLNK, cleared when finished
+CALCCK DATA >0000               * calculated checksum is written here, for debugging
+
+* code checksum
+CHKSUM DATA >6355               * Use emulator to determine value once code is finalized.
+
+* buffers to store registers during context switches - this way
+* I don't need to preserve registers between the old CPU and GPU
+* components, which were on separate CPUs in the original code
+CPUBUF BSS 32
+GPUBUF BSS 32
+
+* code starts here!
+START  
+*      Checksum the code to help ensure it loaded from disk
+*      without error.
+       LI   R0,START
+       CLR  R1
+       LI   R2,CPUEND-START/2
+CSUM01 A    *R0+,R1
+       DEC  R2
+       JNE  CSUM01
+       LI   R0,GSTART
+       LI   R2,GPUEND-GSTART/2
+CSUM02 A    *R0+,R1
+       DEC  R2
+       JNE  CSUM02
+       MOV  R1,@CALCCK
+       
+       LI   R10,STACK						* I know the GPU has a stack, but I want to minimize code changes
+*      Detect F18A (just gets version number now)
+       BL   @F18ADT
+*      Graphics mode
+       BL   @GMODE
+
+*      Display the checksum
+       LI   R0,0*32+0+NAMETB  * Display the checksum at screen location 0
+       MOV  @CALCCK,R1
+       BL   @HEXDMP
+       
+*      Checksum test
+       MOV  @CALCCK,R1
+       C    R1,@CHKSUM
+       JNE  FAILQUIT
+
+* init our host interface (host was supposed to do this for us)
+       SETO @KEY
+       CLR  @RESULT
+       CLR  @DSRLNK
+       
+*      init GPU variables
+MAIN1  LI   R0,>0A00
+       MOV  R0,@UPDSRC
+       CLR  @UPDDST
+       LI   R0,>0600
+       MOV  R0,@UPDLEN
+       CLR  @GPUFNO
+       CLR  @GPUBNO
+       CLR  @GPUCRC
+       CLR  @GPURES
+
+*      Check that all files are present
+       LI   R0,FILEN1           * Bit stream file
+       LI   R2,FILEL1
+       BL   @CKFILE
+       MOV  R0,R0               * Check for error
+       JNE  FAILQUIT
+       LI   R0,FILEN2           * Extra data file
+       LI   R2,FILEL2
+       BL   @CKFILE
+       MOV  R0,R0               * Check for error
+       JNE  FAILQUIT
+*      Display initial information
+       BL   @DSPINF
+       MOV  R0,R0               * Check for quit
+       JNE  QUIT
+*      Initialize progress indicator
+       BL   @INIPGI
+*      Display power message
+       LI   R0,8*32+1+NAMETB
+       LI   R1,POWER
+       LI   R2,29
+       BL   @VMBW
+
+*      Call GPU initialize routine
+       BL   @STSCLR
+       LI   R0,GPUINI
+       BL   @DO_GPU
+
+*      Read bit stream file
+       BL   @RDBIT
+       MOV  R0,R0               * Check for error
+       JNE  FAILQUIT
+*      Read extra data file
+       BL   @RDEXT
+       MOV  R0,R0               * Check for error
+       JNE  FAILQUIT
+
+*      Call GPU finalization routine
+       LI   R0,GPUUPD
+       BL   @DO_GPU
+       
+       BL   @VERIFY
+       MOV  R0,R0             * R0 == >0000 if successful
+       JNE  MAIN1             * Recopy GPU code to reset initial data variables
+
+*      Call GPU clean up routine
+       LI   R0,GPUCLN
+       BL   @DO_GPU
+       
+*      Display completed messages
+       LI   R0,8*32+NAMETB    * Clear area
+       LI   R1,>2000
+       LI   R2,64
+       BL   @VSMW
+
+       LI   R0,8*32+4+NAMETB
+       LI   R1,UPDCOM
+       LI   R2,23
+       BL   @VMBW
+
+       LI   R0,9*32+4+NAMETB
+       LI   R1,PRESSA
+       LI   R2,23
+       BL   @VMBW
+
+*      Wait for keypress
+ENDIT  
+*      Quit
+QUIT   IDLE
+       JMP QUIT
+FAILQUIT
+       SETO @RESULT
+       JMP QUIT
+*// MAIN
+
+
+**
+* Display R1 as a hex number at screen location in R0
+* Destroys R2
+*
+HEX    TEXT '0123456789ABCDEF'
+HEXDMP
+       MOV  R1,R2
+       ANDI R2,>F000          * Isolate the first digit
+       SRL  R2,12             * Convert to a number
+       MOVB @HEX(R2),*R0+     * Convert to ASCII and write to the screen
+
+       MOV  R1,R2
+       ANDI R2,>0F00
+       SRL  R2,8
+       MOVB @HEX(R2),*R0+
+
+       MOV  R1,R2
+       ANDI R2,>00F0
+       SRL  R2,4
+       MOVB @HEX(R2),*R0+
+
+       MOV  R1,R2
+       ANDI R2,>000F
+       MOVB @HEX(R2),*R0+
+
+       B    *R11
+*// HEXDMP
+
+**
+* Backup GPU registers to a buffer (not memory mapped?)
+* R0 = target buffer, skips R0 for that reason, skips R11 cause return
+BACKUPREG
+			INCT R0
+			MOV R1,*R0+
+			MOV R2,*R0+
+			MOV R3,*R0+
+			MOV R4,*R0+
+			MOV R5,*R0+
+			MOV R6,*R0+
+			MOV R7,*R0+
+			MOV R8,*R0+
+			MOV R9,*R0+
+			MOV R10,*R0+
+			INCT R0
+			MOV R12,*R0+
+			MOV R13,*R0+
+			MOV R14,*R0+
+			MOV R15,*R0
+      B   *R11
+
+**
+* Restore GPU registers from a buffer (not memory mapped?)
+* R0 = target buffer, skips R0 for that reason, skips R11 cause return
+RESTOREREG
+		  INCT R0
+			MOV *R0+,R1
+			MOV *R0+,R2
+			MOV *R0+,R3
+			MOV *R0+,R4
+			MOV *R0+,R5
+			MOV *R0+,R6
+			MOV *R0+,R7
+			MOV *R0+,R8
+			MOV *R0+,R9
+			MOV *R0+,R10
+			INCT R0
+			MOV *R0+,R12
+			MOV *R0+,R13
+			MOV *R0+,R14
+			MOV *R0,R15
+			AI  R0,-30
+			MOV *R0,R0
+      B   *R11
+
+**
+* Call a GPU routine and handle its return too
+* R0 = address of GPU routine in VRAM
+*
+DO_GPU
+       MOV  R11,*R10+         * Push return address onto the stack
+
+* backup the CPU registers (start with the ones we overwrite)
+       MOV  R0,@CPUBUF        * save target
+       LI   R0,CPUBUF
+       BL   @BACKUPREG        * backup CPU registers
+       
+       LI   R0,GPUBUF
+       BL   @RESTOREREG       * restore the GPU registers
+			 
+			 MOV  @CPUBUF,R11       * get the target
+			 BL   *R11              * do the branch
+			 
+			 MOV  R0,@GPUBUF
+       LI   R0,GPUBUF
+       BL   @BACKUPREG        * backup GPU registers
+       
+       LI   R0,CPUBUF
+       BL   @RESTOREREG       * restore CPU registers
+
+       DECT R10               * Pop return address off the stack
+       MOV  *R10,R11
+       B    *R11
+*// DO_GPU
+
+
+*********************************************************************
+*
+* Display initial information
+*
+DSPINF MOV  R11,*R10+           * Push return address onto the stack
+*      Display info
+       LI   R0,2*32+6+NAMETB
+       LI   R1,F18UPD
+       LI   R2,20
+       BL   @VMBW
+
+       LI   R0,8*32+NAMETB
+       LI   R1,>2000
+       LI   R2,64
+       BL   @VSMW
+
+       LI   R0,8*32+7+NAMETB
+       LI   R1,PRESSP
+       LI   R2,18
+       BL   @VMBW
+
+       LI   R0,9*32+10+NAMETB
+       LI   R1,PRESSQ
+       LI   R2,12
+       BL   @VMBW
+
+*      Display version numbers
+       LI   R0,4*32+8+NAMETB
+       LI   R1,YVRLBL
+       LI   R2,14
+       BL   @VMBW
+       MOV  @F18VER,R2
+       BL   @DSPVER
+
+       LI   R0,5*32+8+NAMETB
+       LI   R1,VERLBL
+       LI   R2,14
+       BL   @VMBW
+       LI   R2,FRMVER
+       BL   @DSPVER
+
+*      Check keys
+       SETO @KEY
+DSPIN1 CB   @P,@KEY
+       JEQ  DSPIN3
+       CB   @Q,@KEY
+       JEQ  DSPIN2
+       JMP  DSPIN1
+*      Quit
+DSPIN2 SETO R0                  * Signal quit
+       JMP  DSPIN4
+*      Clear info
+DSPIN3 BL   @DSPCLR
+       CLR  R0                  * Signal continue
+*      Return
+DSPIN4 DECT R10                 * Pop return address off the stack
+       MOV  *R10,R11
+       B    *R11
+*// DSPINF
+
+
+**
+* Clears lines 8 to 13
+*
+DSPCLR
+       MOV  R11,*R10+           * Push return address onto the stack
+       LI   R0,8*32+NAMETB
+       LI   R1,>2000
+       LI   R2,192
+       BL   @VSMW
+
+       DECT R10                 * Pop return address off the stack
+       MOV  *R10,R11
+       B    *R11
+*// DSPCLR
+
+
+**
+* Clears lines 14 to 20
+*
+STSCLR
+       MOV  R11,*R10+           * Push return address onto the stack
+       LI   R0,14*32+NAMETB
+       LI   R1,>2000
+       LI   R2,224
+       BL   @VSMW
+
+       DECT R10                 * Pop return address off the stack
+       MOV  *R10,R11
+       B    *R11
+*// STSCLR
+
+
+*********************************************************************
+*
+* Display version No
+*
+* R0 contains VDP address
+* R1 is scratch
+* R2 contains primary version number in MSB
+* and secondary version number in LSB
+*
+DSPVER MOV  R2,R1
+       AI   R1,>3000            * Add ASCII code for 0
+       MOVB R1,*R0+
+       LI   R1,>2E00            * Full stop
+       MOVB R1,*R0+
+       MOV  R2,R1               * LSB
+       SWPB R1
+       AI   R1,>3000
+       MOVB R1,*R0+
+       B    *R11
+*// DPSVER
+
+*********************************************************************
+*
+* Read bit stream file
+*
+RDBIT  MOV  R11,*R10+           * Push return address onto the stack
+*      Setup variables and callback
+       LI   R0,1                * File number
+       MOV  R0,@FILENO
+       CLR  @BLKNO
+       LI   R0,FL1CRC           * CRC table
+       MOV  R0,@CRCTBL
+       LI   R0,FILE1S/BLKSIZ    * Number of blocks to read
+       MOV  R0,@BLKCNT
+       LI   R0,CALLBK           * Callback adress from RDFILE
+       MOV  R0,@FILECB
+       LI   R0,FILEN1           * File name
+       LI   R2,FILEL1           * File name length
+*      Call the file reading routine
+       BL   @RDFILE
+*      Return
+       DECT R10                 * Pop return address off the stack
+       MOV  *R10,R11
+       B    *R11
+*// RDBIT
+
+*********************************************************************
+*
+* Read extra data file
+*
+RDEXT  MOV  R11,*R10+           * Push return address onto the stack
+*      Setup variables and callback
+       LI   R0,2                * File number
+       MOV  R0,@FILENO
+       CLR  @BLKNO
+       LI   R0,FL2CRC           * CRC table
+       MOV  R0,@CRCTBL
+       LI   R0,FILE2S/BLKSIZ    * Number of blocks to read
+       MOV  R0,@BLKCNT
+       LI   R0,CALLBK           * Callback adress from RDFILE
+       MOV  R0,@FILECB
+       LI   R0,FILEN2           * File name
+       LI   R2,FILEL2           * File name length
+*      Call the file reading routine
+       BL   @RDFILE
+*      Return
+       DECT R10                 * Pop return address off the stack
+       MOV  *R10,R11
+       B    *R11
+*// RDEXT
+
+*********************************************************************
+*
+* Callback routine after block is read
+*
+CALLBK MOV  R11,*R10+           * Push return address onto the stack
+*      Update progress indicator
+       INC  @PGICNT
+       BL   @UPDPGI
+*      Setup parameters for GPU routine
+       MOV  @FILENO,@GPUFNO     * File number
+			 MOV  @BLKNO,@GPUBNO      * Block number
+       MOV  @BLKNO,R1
+       SLA  R1,1                * Convert to word offset
+       A    @CRCTBL,R1
+       MOV  *R1,@GPUCRC					* CRC checksum
+       CLR  @GPURES             * Clear result
+*      Call GPU routine
+			 LI   R0,GPUCPY						* System crashes if this is BL @GPUCPY on HW only. WHY?
+       BL   @DO_GPU							* original code did this inline
+			 MOV  @GPURES,R1
+       CI   R1,>0001            * Check for success
+       JEQ  CALLB2
+*      Display error message
+       LI   R0,11*32+9+NAMETB  * Position
+       LI   R1,CRCERR           * Source address
+       LI   R2,9                * Length
+       BL   @VMBW
+       SETO R0
+       JMP  CALLB3
+CALLB2 CLR  R0
+*      Update block number
+CALLB3 INC  @BLKNO
+*      Return
+       DECT R10                 * Pop return address off the stack
+       MOV  *R10,R11
+       B    *R11
+*// CALLBK
+
+
+**
+* Verify the data written to the final SPI sectors.
+* Similar to the call-back function but does not
+* need to read the data files from disk, only passes
+* the file no, block no, and CRC to the GPU verify routine.
+*
+* Returns >0000 if successful, otherwise >FFFF
+*
+VERIFY
+       MOV  R11,*R10+         * Push return address onto the stack
+       BL   @INIPGI
+
+*      Setup file 1
+       LI   R0,1
+       MOV  R0,@FILENO
+       MOV  @FILENO,@GPUFNO		* File number
+
+       CLR  @BLKNO            * Start at block 0
+
+       LI   R0,FL2CRC-FL1CRC
+       SRA  R0,1              * Get the number of CRC values for the file
+       MOV  R0,@BLKCNT
+
+       LI   R0,FL1CRC         * CRC table
+       MOV  R0,@CRCTBL
+
+       BL   @VFYFIL
+       MOV  R0,R0             * R0 == >0000 if successful
+       JNE  VERRET
+
+*      Setup file 2
+       LI   R0,2
+       MOV  R0,@FILENO
+       MOV  @FILENO,@GPUFNO   * File number
+
+       CLR  @BLKNO            * Start at block 0
+
+       LI   R0,FLCRCE-FL2CRC
+       SRA  R0,1              * Get the number of CRC values for the file
+       MOV  R0,@BLKCNT
+
+       LI   R0,FL2CRC         * CRC table
+       MOV  R0,@CRCTBL
+
+       BL   @VFYFIL
+
+*      Return
+VERRET
+       DECT R10               * Pop return address off the stack
+       MOV  *R10,R11
+       B    *R11
+*// VERIFY
+
+
+**
+* Drives the CRC error value and block count to the GPU verify routine
+* that will CRC check the block from the flash.
+*
+VFYFIL
+       MOV  R11,*R10+         * Push return address onto the stack
+
+*      Update progress indicator
+VRFY05
+       INC  @PGICNT
+       BL   @UPDPGI
+
+       MOV  @BLKNO,@GPUBNO    * block number
+       MOV  @CRCTBL,R1
+       MOV  *R1,@GPUCRC       * CRC checksum
+
+       CLR  @GPURES           * Clear result
+
+*      Call GPU routine
+		   LI   R0,GPUVFY
+       BL   @DO_GPU						* original code did this inline
+
+*      Check on GPU completion
+VRFY20 MOV  @GPURES,R1
+       CI   R1,>0001          * 1 == success
+       JNE  VFYERR
+
+       INC  @BLKNO            * Update block number
+       INCT @CRCTBL           * Next CRC value
+       DEC  @BLKCNT           * Count the block
+       JNE  VRFY05
+
+       CLR  R0                * Return R0 = >0000
+       JMP  VFYRET
+
+*      Display error message
+VFYERR
+       BL   @DSPCLR
+       LI   R0,11*32+0+NAMETB
+       LI   R1,TVFY01
+       LI   R2,64             * Two lines of text, 32 bytes each
+       BL   @VMBW
+       SETO R0                * Return R0 = >FFFF
+
+*      Return
+VFYRET
+       DECT R10               * Pop return address off the stack
+       MOV  *R10,R11
+       B    *R11
+*// VFYFIL
+
+
+*********************************************************************
+*
+* Read file
+*
+* R0:   Address of file name
+* R2:   Length of file name
+* @RECCNT contains number of records to read
+* @FILECB contains address of routine to call when a record is read
+*
+RDFILE MOV  R11,*R10+           * Push return address onto the stack
+       MOV  R2,R1
+       AI   R1,5
+       MOV  R1,@FILENL          * Set file name length
+       LI   R1,FILENM
+SETFNM MOVB *R0+,*R1+           * Set the file name
+       DEC  R2
+       JNE  SETFNM
+       LI   R0,>2000            * Pad with spaces
+SETFN1 CI   R1,PABDTE
+       JEQ  SETFN2
+       MOVB R0,*R1+
+       JMP  SETFN1
+*      Copy PAB data into VDP RAM
+SETFN2 LI   R0,PAB
+       LI   R1,PABDAT
+       LI   R2,PABDTE-PABDAT
+       BL   @VMBW
+*      Open
+       LI   R0,PAB              * pointer to base DSR
+       MOV  R0,@DSRLNK          * ask the host to do it
+       IDLE                     * wait for the host to finish
+       CLR  @DSRLNK
+*      Check for errors
+       MOVB @PAB+1,R1           * Get status byte
+       ANDI R1,>E000            * Mask off error code
+       JNE  FERROR
+*      Read
+       LI   R1,>0200            * READ op-code
+       MOVB R1,@PAB             * Change op-code to READ
+BLKLP  LI   R0,BLKSIZ*8         * 8 records of 128 bytes per KB
+       MOV  R0,@RECCNT
+       LI   R0,PABBUF           * Setup destination address
+       MOV  R0,@DSTADR
+       CLR  R1
+       LI   R2,BLKSIZ*1024
+       BL   @VSMW               * Clear VDP buffer
+RECLP  MOV  @DSTADR,@PAB+2      * Write destination to PAB
+       LI   R0,PAB              * pointer to base DSR
+       MOV  R0,@DSRLNK          * ask the host to do it
+       IDLE                     * wait for the host to finish
+       CLR  @DSRLNK
+*      Check for errors
+       MOVB @PAB+1,R1           * Get status byte
+       ANDI R1,>E000            * Mask off error code
+       JNE  FERROR
+       MOVB @PAB+5,R1           * Get bytes read
+       CI   R1,>8000            * Check if 128 bytes read
+       JNE  FERROR
+*      Update destination address
+       LI   R0,128
+       A    R0,@DSTADR
+*      Inner loop
+       DEC  @RECCNT
+       JNE  RECLP
+*      Call callback routine
+       MOV  @FILECB,R0
+       BL   *R0
+       MOV  R0,R0               * Check for error
+       JNE  RDFEND
+*      Outer loop
+       DEC  @BLKCNT
+       JNE  BLKLP
+*      Close
+       LI   R1,>0100            * CLOSE op-code
+       MOVB R1,@PAB             * Change op-code to CLOSE
+       LI   R0,PAB              * pointer to base DSR
+       MOV  R0,@DSRLNK          * ask the host to do it
+       IDLE                     * wait for the host to finish
+       CLR  @DSRLNK
+*      Signal success
+       CLR  R0
+       JMP  RDFEND
+*      File error
+FERROR SRL  R1,5                * Move error code bits into place in MSB
+       CI   R1,>0500            * Error code 5 = end of file
+       JNE  FERR1
+       C    @ONE,@BLKCNT        * Check if we're at the last block
+       JNE  FERR1
+*      Call callback routine one last time
+       MOV  @FILECB,R0
+       BL   *R0
+       MOV  R0,R0               * Check for error
+       JNE  RDFEND
+*      Signal success
+       CLR  R0
+       JMP  RDFEND
+FERR1  AI   R1,>3000            * Add ASCII code for 0
+       MOVB R1,@FILERR+11
+*      Display error
+       LI   R0,10*32+10+NAMETB  * Position
+       LI   R1,FILERR           * Source address
+       LI   R2,12               * Length
+       BL   @VMBW
+*      Signal error
+       SETO R0
+*      Return
+RDFEND DECT R10                 * Pop return address off the stack
+       MOV  *R10,R11
+       B    *R11
+*// RDFILE
+
+*********************************************************************
+*
+* Check for file existence
+*
+* R0:   Address of file name
+* R2:   Length of file name
+*
+CKFILE MOV  R11,*R10+           * Push return address onto the stack
+       MOV  R2,R1
+       AI   R1,5
+       MOV  R1,@FILENL          * Set file name length
+       LI   R1,FILENM
+CKFIL1 MOVB *R0+,*R1+           * Set the file name
+       DEC  R2
+       JNE  CKFIL1
+       LI   R0,>2000            * Pad with spaces
+CKFIL2 CI   R1,PABDTE
+       JEQ  CKFIL3
+       MOVB R0,*R1+
+       JMP  CKFIL2
+*      Copy PAB data into VDP RAM
+CKFIL3 LI   R0,PAB
+       LI   R1,PABDAT
+       LI   R2,PABDTE-PABDAT
+       BL   @VMBW
+*      Open
+       LI   R0,PAB              * pointer to base DSR
+       MOV  R0,@DSRLNK          * ask the host to do it
+       IDLE                     * wait for the host to finish
+       CLR  @DSRLNK
+*      Check for errors
+       MOVB @PAB+1,R1           * Get status byte
+       ANDI R1,>E000            * Mask off error code
+       JNE  CKFIL4
+*      Close
+       LI   R1,>0100            * CLOSE op-code
+       MOVB R1,@PAB             * Change op-code to READ
+       LI   R0,PAB              * pointer to base DSR
+       MOV  R0,@DSRLNK          * ask the host to do it
+       IDLE                     * wait for the host to finish
+       CLR  @DSRLNK
+*      Signal success
+       CLR  R0
+       JMP  CKFIL6
+*      File error
+CKFIL4 SRL  R1,5                * Move error code bits into place in MSB
+       MOV  R1,R3               * Save it
+       AI   R1,>3000            * Add ASCII code for 0
+       MOVB R1,@FILERR+11       * Copy into error message
+*      Display error
+       LI   R0,10*32+10+NAMETB  * Position
+       LI   R1,FILERR           * Source address
+       LI   R2,12               * Length
+       BL   @VMBW
+       CI   R3,>0700            * Check for file not found
+       JNE  CKFIL5
+       LI   R0,12*32+2+NAMETB   * Position
+       LI   R1,FNFERR           * Source address
+       LI   R2,15               * Length
+       BL   @VMBW
+       LI   R0,12*32+17+NAMETB  * Position
+       LI   R1,FILEDV
+       MOV  @FILENL,R2          * Length
+       BL   @VMBW
+*      Signal error
+CKFIL5 SETO R0
+*      Return
+CKFIL6 DECT R10                 * Pop return address off the stack
+       MOV  *R10,R11
+       B    *R11
+*// CKFILE
+
+*********************************************************************
+*
+* Initialize progress indicator
+*
+INIPGI MOV  R11,*R10+           * Push return address onto the stack
+       CLR  @PGICNT             * Clear counter
+       LI   R0,21*32+NAMETB
+       LI   R1,PGIDAT
+       LI   R2,96
+       BL   @VMBW
+*      Return
+       DECT R10                 * Pop return address off the stack
+       MOV  *R10,R11
+       B    *R11
+*// INIPGI
+
+*********************************************************************
+*
+* Update progress indicator
+*
+* Progress is controlled by @PGICNT (0 - (PGITOT-1))
+*
+UPDPGI MOV  R11,*R10+           * Push return address onto the stack
+       LI   R3,PGIW             * Width of progress indicator
+       MPY  @PGICNT,R3          * Multiply by progress counter
+       LI   R0,PGITOT
+       DIV  R0,R3               * Divide by total number of blocks
+       LI   R0,22*32+1+NAMETB
+*      Full patterns
+       LI   R1,>0700            * Full pattern
+       MOV  R3,R2
+       SRA  R2,3                * Calculate number of full patterns
+       JEQ  UPDPG1
+UPDPG0 MOVB R1,*R0+             * Write full patterns to VDP
+       DEC  R2
+       JNE  UPDPG0
+*      Partial pattern
+UPDPG1 MOV  R3,R1
+       ANDI R1,>0007            * Mod 8
+       JEQ  UPDPG2
+       DEC  R1
+       SWPB R1
+       MOVB R1,*R0+             * Write partial pattern to VDP
+       SETO R1                  * Signal partial pattern
+*      Empty patterns
+UPDPG2 SRA  R3,3                * Calculate number of empty patterns
+       LI   R2,30
+       S    R3,R2               * 30 - full patterns
+       MOV  R1,R1
+       JEQ  UPDPG3
+       DEC  R2                  * -1 if there is a partial pattern
+UPDPG3 MOV  R2,R2
+       JEQ  UPDPG5
+       LI   R1,>2000            * Space
+UPDPG4 MOVB R1,*R0+             * Write space to VDP
+       DEC  R2
+       JNE  UPDPG4
+*      Return
+UPDPG5 DECT R10                 * Pop return address off the stack
+       MOV  *R10,R11
+       B    *R11
+*// INIPGI
+
+*********************************************************************
+*
+* Get version number (we are running on the F18A, so it must exist)
+*
+F18ADT MOV  R11,*R10+           * Push return address onto the stack
+*      Get the version number
+       CLR  R0
+       MOVB @>A000,R0           * read the version register
+       MOV  R0,R1
+       ANDI R0,>F000
+       SRL  R0,4                * MSB - major version no
+       ANDI R1,>0F00
+       SRL  R1,8
+       SOC  R1,R0               * LSB - minor version no
+       MOV  R0,@F18VER
+F18ADE DECT R10                 * Pop return address off the stack
+       MOV  *R10,R11
+       B    *R11
+*// F18ADT
+
+*********************************************************************
+*
+* Setup graphics mode
+*
+GMODE  MOV  R11,*R10+           * Push return address onto the stack
+       LI   R0,>0000            * Reg 0: Graphics mode I,
+       MOVB R0,@>6000           * external video off
+       LI   R0,>C200            * Reg 1: 16K, display on, no interrupt,
+       MOVB R0,@>6001           * size = 1, mag = 0.
+       LI   R0,>0000            * Reg 2: Name table
+       MOVB R0,@>6002           * NAMETB = >1800 (>06 * >400), >300 bytes
+       LI   R0,>0E00            * Reg 3: Color Table
+       MOVB R0,@>6003           * COLRTB = >0380 (>0E * >40), >20 bytes
+       LI   R0,>0100            * Reg 4: Pattern Table
+       MOVB R0,@>6004           * PTRNTB = >0800 (>01 * >800), >800 bytes
+       LI   R0,>0600            * Reg 5: Sprite Attribute Table
+       MOVB R0,@>6005           * SPRATB = >0300 (>06 * >80), >80 bytes
+       LI   R0,>0100            * Reg 6: Sprite Pattern Table
+       MOVB R0,@>6006           * SPRPTB = >0800 (>01 * >800), >800 bytes
+       LI   R0,>F400            * Reg 7: Text-mode color and backdrop color
+       MOVB R0,@>6007           * Blue backdrop
+*      Disable sprites
+       LI   R1,>D000
+       MOVB R1,@SPRATB
+*      Initialize color table
+       LI   R0,COLRTB
+       LI   R1,CLRSET
+       LI   R2,>20              * 32 bytes
+       BL   @VMBW
+*      Clear name table
+       LI   R0,NAMETB
+       LI   R1,>2000            * Space
+       LI   R2,>300             * 768 bytes
+       BL   @VSMW
+*      Initialize patterns
+       LI   R0,PTRNTB
+       LI   R1,PAT0
+       LI   R2,16*8             * 16 patterns
+       BL   @VMBW
+*      Return
+       DECT R10                 * Pop return address off the stack
+       MOV  *R10,R11
+       B    *R11
+*// GMODE
+
+*********************************************************************
+*
+* VDP Single Byte Multiple Write
+*
+* R0   Starting write address in VDP RAM
+* R1   MSB of R1 sent to VDP RAM
+* R2   Number of times to write the MSB byte of R1 to VDP RAM
+*
+VSMW   MOVB R1,*R0+             * Write byte to VDP RAM
+       DEC  R2                  * Byte counter
+       JNE  VSMW                * Check if done
+       B    *R11
+*// VSMW
+
+*********************************************************************
+*
+* VDP Multiple Byte Write
+*
+* R0   Starting write address in VDP RAM
+* R1   Starting read address in CPU RAM
+* R2   Number of bytes to send to the VDP RAM
+*
+VMBW   MOVB *R1+,*R0+           * Write byte to VDP RAM
+       DEC  R2                  * Byte counter
+       JNE  VMBW                * Check if done
+       B    *R11
+*// VMBW
+
+*********************************************************************
+*
+* VDP Multiple Byte Read
+*
+* R0   Starting read address in VDP RAM
+* R1   Starting write address in CPU RAM
+* R2   Number of bytes to read from VDP RAM
+*
+VMBR   MOVB *R0+,*R1+           * Read byte from VDP RAM
+       DEC  R2                  * Byte counter
+       JNE  VMBR                * Check if finished
+       B    *R11
+*// VMBR
+
+*********************************************************************
+*
+* Data section
+*
+STACK  EQU  >3740								* try to stay under >37D7 for TI 3 files
+
+F18VER DATA >0000               * F18A version
+BLKCNT DATA >0000               * Number of file blocks of 4K to read
+RECCNT DATA >0000               * Number of file records to read
+FILECB DATA >0000               * Address of file reading callback routine
+DSTADR DATA >0000               * File destination address
+BLKNO  DATA >0000               * Number of last block read
+FILENO DATA >0000               * Number of current file
+CRCTBL DATA >0000               * Base adress of current CRC table
+PGICNT DATA >0000               * Progress indicator counter
+
+PABDAT BYTE >00                 * I/O op-code (0=READ, 1=CLOSE, 2=READ)
+       BYTE >0C                 * Flags: Fixed, Internal, Input, Sequential
+       DATA PABBUF              * Data buffer address (VDP RAM)
+       DATA >8000               * 128 bytes record length / bytes read
+       DATA >0000               * Record number (not used for sequential)
+FILENL DATA >000C               * File name length
+FILEDV TEXT "DSK1."             * File device
+FILENM TEXT "          "        * File name
+       EVEN
+PABDTE
+
+*      Text
+F18UPD TEXT "F18A Firmware update"
+YVRLBL TEXT " Found F18A: V"
+VERLBL TEXT "Update file: V"
+PRESSP TEXT "Press P to proceed"
+PRESSQ TEXT "or Q to quit"
+POWER  TEXT "* DO NOT TURN OFF THE POWER *"
+       EVEN
+UPDCOM TEXT ">>> UPDATE COMPLETE <<<"
+       EVEN
+PRESSA TEXT "Power cycle your system"
+       EVEN
+       
+FILERR TEXT "FILE ERROR N"
+FNFERR TEXT "FILE NOT FOUND "
+       EVEN
+F18ERR TEXT "F18A NOT DETECTED"
+CRCERR TEXT "FILE CRC ERROR"
+TVFY01 TEXT "FLASH VERIFY ERROR! DO NOT POWER"
+TFFY02 TEXT "OFF. PRESS P TO TRY UPDATE AGAIN"
+
+*      Constants
+ONE    DATA >0001
+COND   DATA >0200
+P      BYTE >50
+Q      BYTE >51
+
+*      Color sets
+CLRSET BYTE >F0,>E0,>F0,>F0
+       BYTE >F0,>F0,>F0,>F0
+       BYTE >F0,>F0,>F0,>F0
+       BYTE >F0,>F0,>F0,>F0
+       BYTE >10,>10,>10,>10
+       BYTE >10,>10,>10,>10
+       BYTE >10,>10,>10,>10
+       BYTE >10,>10,>10,>10
+
+*      Progress indicator patterns
+PAT0   DATA >8080,>8080,>8080,>8080
+PAT1   DATA >C0C0,>C0C0,>C0C0,>C0C0
+PAT2   DATA >E0E0,>E0E0,>E0E0,>E0E0
+PAT3   DATA >F0F0,>F0F0,>F0F0,>F0F0
+PAT4   DATA >F8F8,>F8F8,>F8F8,>F8F8
+PAT5   DATA >FCFC,>FCFC,>FCFC,>FCFC
+PAT6   DATA >FEFE,>FEFE,>FEFE,>FEFE
+PAT7   DATA >FFFF,>FFFF,>FFFF,>FFFF
+PAT8   DATA >0000,>0000,>0F08,>0B0A
+PAT9   DATA >0000,>0000,>FF00,>FF00
+PAT10  DATA >0000,>0000,>F010,>D050
+PAT11  DATA >0A0B,>080F,>0000,>0000
+PAT12  DATA >00FF,>00FF,>0000,>0000
+PAT13  DATA >50D0,>10F0,>0000,>0000
+PAT14  DATA >0A0A,>0A0A,>0A0A,>0A0A
+PAT15  DATA >5050,>5050,>5050,>5050
+
+*      Progress indicator
+PGIDAT DATA >0809,>0909,>0909,>0909
+       DATA >0909,>0909,>0909,>0909
+       DATA >0909,>0909,>0909,>0909
+       DATA >0909,>0909,>0909,>090A
+       DATA >0E20,>2020,>2020,>2020
+       DATA >2020,>2020,>2020,>2020
+       DATA >2020,>2020,>2020,>2020
+       DATA >2020,>2020,>2020,>200F
+       DATA >0B0C,>0C0C,>0C0C,>0C0C
+       DATA >0C0C,>0C0C,>0C0C,>0C0C
+       DATA >0C0C,>0C0C,>0C0C,>0C0C
+       DATA >0C0C,>0C0C,>0C0C,>0C0D
+
+*      Configuration
+FILEL1 EQU  7
+FILEN1 TEXT "F18ABIN"
+       EVEN
+FILEL2 EQU  7
+FILEN2 TEXT "F18AROM"
+       EVEN
+*      Cyclic Redundancy Check (CRC) checksums
+
+FL1CRC DATA >B9EE,>81AC,>5697,>C018
+       DATA >ACBC,>EDA7,>6239,>04CA
+       DATA >F169,>CE10,>6C42,>616B
+       DATA >E917,>64AC,>0186,>C730
+       DATA >3A68,>E2D7,>31C9,>C185
+       DATA >9D81,>CA03,>A920,>2F6E
+       DATA >2296,>3F3B,>D7E9,>4A38
+       DATA >E509,>9B8E,>5605,>7B25
+       DATA >9D16,>DB4D,>0C02,>B0A7
+       DATA >5223,>EE40,>E82B,>33A2
+       DATA >77C8,>62DA,>5C9E,>4499
+       DATA >F026,>19F6,>B4F4,>C2CF
+       DATA >3A71,>DF12,>6BC1,>7A59
+       DATA >FBCD,>6ADD,>8F4A,>F725
+       DATA >A2AC,>ADEF,>FB91,>C09F
+       DATA >3CC7,>DC9F,>6522,>8CCD
+       DATA >0000,>0000,>7EEC,>59D4
+       DATA >0B8E,>5729,>6668,>4477
+       DATA >DC51,>CE4F,>20CA,>0000
+       DATA >E5A9,>971F,>1345,>4A89
+       DATA >E7BF,>FE48,>C0C7
+
+FL2CRC DATA >E639,>9AED,>2914,>BA68
+       DATA >0417,>FC80,>BF6C,>CFA9
+       DATA >F43B,>CD62,>6DAA,>F53D
+       DATA >1C0C,>65BB,>13C0,>982A
+       DATA >7357,>3B93,>5AB5,>D296
+       DATA >FA80,>265C,>69E1
+FLCRCE
+
+CPUEND
+
+*********************************************************************
+*
+* GPU routines
+*
+
+GSTART
+
+**
+* Clear high end SPI Flash sectors for a temp buffer
+* Sectors 10 - 15 or >0A0000 to >0F0000
+GPUINI
+       LI   R15,GPUPRG-2      * Set up the stack pointer
+
+       LI   R4,14*32+0+NAMETB * Initialize the last line for display output
+       MOV  R4,@LASTLN
+
+       LI   R4,GMSG1          * "CLEARING SECTOR"
+       LI   R5,GMSG1E-GMSG1
+       BSTK @SHOWTXT          * Leaves R6 at end of displayed text
+
+       LI   R1,>0A00
+       LI   R2,6
+       BSTK @SERASE
+
+       A    @NEWLN,@LASTLN    * Next line for copy process
+       B    *R11
+*// GPUINI
+
+
+**
+* Clean up sectors 10 - 15 or >0A0000 to >0F0000
+GPUCLN
+       A    @NEWLN,@LASTLN    * Next line for copy process
+       LI   R4,GMSG7          * "CLEANING UP"
+       LI   R5,GMSG7E-GMSG7
+       BSTK @SHOWTXT          * Leaves R6 at end of displayed text
+
+       LI   R1,>0A00
+       LI   R2,6
+       BSTK @SERASE
+
+       B    *R11
+*// GPUCLN
+
+
+*********************************************************************
+* Copy data block to SPI staging sectors.  Called in a loop during
+* the host system's disk read process.
+*
+* GPUFNO = current file number, 1-based
+* GPUBNO = current file block number
+* PABBUF = block of data to copy
+* BLKSIZ = size of data block in KiB
+*
+GPUCPY
+       MOV  @GPUFNO,R0        * Check the file being copied
+       DEC  R0                * File numbers are 1-based
+       JNE  CPY05
+       LI   R9,>0A00          * Staging block for bit stream
+       LI   R4,GMSG2          * "STAGING BIT STREAM"
+       LI   R5,GMSG2E-GMSG2
+       JMP  CPY10
+CPY05
+       LI   R9,>0F00          * Staging block for data file
+       LI   R4,GMSG3          * "STAGING DATA"
+       LI   R5,GMSG3E-GMSG3
+CPY10
+       BSTK @SHOWTXT          * Leaves R6 at end of displayed text
+
+*      Check CRC
+       BSTK @CHKCRC
+       MOV  R0,R0             * Check for error
+       JNE  CPYERR
+
+*      Copy to SPI
+*      The block number needs to be adjusted to a count of 256-byte blocks
+       MOV  R9,R0
+       LI   R1,BLKSIZ*1024/256
+       MOV  @GPUBNO,R2
+       MPY  R1,R2             * Multiply the block number by 256-byte chunks in one block
+       A    R3,R0             * Add the 256-byte block count to the base address
+       LI   R1,PABBUF
+       LI   R2,BLKSIZ*1024
+       BSTK @BWRITE           * Displays page in R0 (0-4095)
+
+*      Signal completion
+       LI   R0,1
+       JMP  CPYEND
+
+*      Signal error
+CPYERR LI   R0,2
+CPYEND MOV  R0,@GPURES
+       B    *R11
+*// GPUCPY
+
+
+***
+* Perform the actual update by copying the bit stream from the staging
+* sectors to the real sectors.
+*
+UPDSRC DATA >0A00
+UPDDST DATA >0000
+UPDLEN DATA >0600
+GPUUPD
+       A    @NEWLN,@LASTLN    * Next line for display
+
+       LI   R4,GMSG1          * "CLEARING SECTOR"
+       LI   R5,GMSG1E-GMSG1
+       BSTK @SHOWTXT          * Leaves R6 at end of displayed text
+
+       CLR  R1                * Clear sectors >0 through >5
+       LI   R2,6              * Clear six sectors
+       BSTK @SERASE           * Increments the current display line
+
+*      Read >0A0000 to >0FFFFF and write to >000000 to >05FFFF
+       A    @NEWLN,@LASTLN    * Next line for display
+       LI   R4,GMSG4          * "UPDATING"
+       LI   R5,GMSG4E-GMSG4
+       BSTK @SHOWTXT          * Leaves R6 at end of displayed text
+UPD_LP
+       MOV  @UPDSRC,R0
+       LI   R1,PABBUF
+       LI   R2,256
+       BSTK @BREAD
+
+       MOV  @UPDDST,R0
+       LI   R1,PABBUF
+       LI   R2,256
+       BSTK @BWRITE           * Displays page in R0 (0-4095)
+
+       INC  @UPDSRC
+       INC  @UPDDST
+       DEC  @UPDLEN
+       JNE  UPD_LP
+
+       A    @NEWLN,@LASTLN    * Next line for display
+
+       B    *R11
+*// GPUUPD
+
+
+**
+* Verify a block in the SPI by calculating the CRC
+*
+* GPUFNO = current file number, 1-based
+* GPUBNO = current file block number
+* BLKSIZ = size of data block in KiB
+*
+GPUVFY
+       MOV  @GPUFNO,R0        * Check the file being copied
+       DEC  R0                * File numbers are 1-based
+       JNE  GVFY05
+       CLR  R9                * Block for bit stream
+       LI   R4,GMSG5          * "VERIFYING BIT STREAM"
+       LI   R5,GMSG5E-GMSG5
+       JMP  GVFY10
+GVFY05
+       LI   R9,>0500          * Block for data file
+       LI   R4,GMSG6          * "VERIFYING DATA"
+       LI   R5,GMSG6E-GMSG6
+GVFY10
+       BSTK @SHOWTXT          * Leaves R6 at end of displayed text
+
+*      Read SPI block to PABBUF
+*      The block number needs to be adjusted to a count of 256-byte blocks
+       MOV  R9,R0
+       LI   R1,BLKSIZ*1024/256               * 2 * 1024 / 256 = 8
+       MOV  @GPUBNO,R2
+       MPY  R1,R2             * Multiply the block number by 256-byte chunks (8) in one block
+       A    R3,R0             * Add the 256-byte block count to the base address
+       LI   R1,PABBUF
+       LI   R2,BLKSIZ*1024
+       BSTK @BREAD            * Reads SPI block into PABBUF
+       BSTK @DSPHEX
+
+*      Check CRC
+       BSTK @CHKCRC
+       MOV  R0,R0             * Check for error
+       JNE  GVFY80            * Set error
+
+*      Signal completion
+       LI   R0,1
+       JMP  GVFY99
+
+*      Signal error
+GVFY80 LI   R0,2
+GVFY99 MOV  R0,@GPURES
+       B    *R11
+*// GPUVFY
+
+
+*********************************************************************
+* Check and display the CRC for a block
+*
+* GPUCRC = expected CRC for the block
+* PABBUF = block to check
+* BLKSIZ = block size in whole KiB, i.e. 1, 2, etc. not 1024, 2048...
+
+*      Calculate CRC
+CHKCRC LI   R1,PABBUF
+       LI   R2,BLKSIZ*1024
+       BSTK @CRC16
+
+*      Display calculated CRC
+       MOV  R6,R2             * Save R6
+       LI   R6,20*32+1+NAMETB
+       LI   R1,GMSCRC         * "CRC:"
+       MOVB *R1+,*R6+
+       MOVB *R1+,*R6+
+       MOVB *R1+,*R6+
+       MOVB *R1+,*R6+
+       BSTK @DSPHEX           * Shows the number in R0 as hex at R6
+
+*      Compare with provided CRC
+       C    @GPUCRC,R0
+       JEQ  CHK80
+
+*      Display expected CRC
+       MOV  @GPUCRC,R0
+       AI   R6,6
+       BSTK @DSPHEX           * Shows the number in R0 as hex at R6
+
+*      Signal failure
+       SETO R0
+       JMP  CHK90
+
+*      Signal success
+CHK80  CLR  R0
+
+*      Return
+CHK90  MOV  R2,R6             * Restore R6
+       RSTK
+*// CHKCRC
+
+
+*********************************************************************
+*
+* Calculate CRC-16
+*
+* R1: Address of data buffer
+* R2: Number of bytes to process
+*
+* Returns the result in R0
+*
+CRC16
+*      unsigned short int crc = start;
+*      int r;
+       CLR  R0                  * R0 is crc
+       CLR  R4                  * R4 is r
+*      /* while there is more data to process */
+*      while (n-- > 0) {
+CRCLP
+*      /* compute checksum of lower four bits of *p */
+*      r = crc_16_table[crc & 0xF];
+       MOV  R0,R3               * crc
+       ANDI R3,>000F            * crc & 0xF
+       SLA  R3,1                * Need word offset
+       MOV  @CRC16T(R3),R4      * crc_16_table[crc & 0xF]
+*      crc = (crc >> 4) & 0x0FFF;
+       SRL  R0,4                * crc >> 4
+       ANDI R0,>0FFF            * (crc >> 4) & 0x0FFF
+*      crc = crc ^ r ^ crc_16_table[*p & 0xF];
+       XOR  R4,R0               * crc ^ r
+       MOVB *R1,R3              * *p
+       SWPB R3                  * Move to LSB
+       ANDI R3,>000F            * *p & 0xF
+       SLA  R3,1                * Need word offset
+       XOR  @CRC16T(R3),R0      * crc ^ r ^ crc_16_table[*p & 0xF]
+*      /* now compute checksum of upper four bits of *p */
+*      r = crc_16_table[crc & 0xF];
+       MOV  R0,R3               * crc
+       ANDI R3,>000F            * crc & 0xF
+       SLA  R3,1                * Need word offset
+       MOV  @CRC16T(R3),R4      * crc_16_table[crc & 0xF]
+*      crc = (crc >> 4) & 0x0FFF;
+       SRL  R0,4                * crc >> 4
+       ANDI R0,>0FFF            * (crc >> 4) & 0x0FFF
+*      crc = crc ^ r ^ crc_16_table[(*p >> 4) & 0xF];
+       XOR  R4,R0               * crc ^ r
+       MOVB *R1,R3              * *p
+       SWPB R3                  * Move to LSB
+       SRL  R3,4                * *p >> 4
+       ANDI R3,>000F            * (*p >> 4) & 0xF
+       SLA  R3,1                * Need word offset
+       XOR  @CRC16T(R3),R0      * crc ^ r ^ crc_16_table[(*p >> 4) & 0xF]
+*      /* next... */
+*      p++;
+       INC  R1
+*      }
+       DEC  R2
+       JNE  CRCLP
+       RSTK
+
+CRC16T DATA >0000,>CC01,>D801,>1400
+       DATA >F001,>3C00,>2800,>E401
+       DATA >A001,>6C00,>7800,>B401
+       DATA >5000,>9C01,>8801,>4400
+*// CRC16
+
+
+**
+* Show text on line 15 (zero offset, i.e. line 16)
+* R4 = Source address of text
+* R5 = Length of text
+* R6 = Output: VRAM address after the last displayed character
+* Destroys R7
+* Destroys R8
+LASTLN DATA 14*32+0+NAMETB
+NEWLN  DATA 32
+SHOWTXT
+       MOV  @LASTLN,R6
+       LI   R7,>2020          * Space tile (32) to MSB and LSB
+       LI   R8,16
+SHOWL1 MOV  R7,*R6+           * Clear the line two tiles at a time
+       DEC  R8
+       JNE  SHOWL1
+       MOV  @LASTLN,R6
+SHOWL2 MOVB *R4+,*R6+
+       DEC  R5
+       JNE  SHOWL2
+       RSTK                   * Return using stack
+*// SHOWTXT
+
+GMSG0  TEXT "0123456789ABCDEF"
+GMSG0E
+GMSG1  TEXT "Clearing sector: "
+GMSG1E BYTE 17
+GMSG2  TEXT "Staging bit stream: "
+GMSG2E
+GMSG3  TEXT "Staging data: "
+GMSG3E
+GMSG4  TEXT "UPDATING: "
+GMSG4E
+GMSG5  TEXT "Verifying bit stream: "
+GMSG5E
+GMSG6  TEXT "Verifying data: "
+GMSG6E
+GMSG7  TEXT "Cleaning up: "
+GMSG7E BYTE 13
+GMSCRC TEXT "CRC:"
+       EVEN
+
+
+**
+* Displays a hex value
+*
+* R0 = hex value to display, not changed
+* R6 = screen location to display number, not changed
+* R7 destroyed
+* R8 destroyed
+
+DSPHEX
+*      Display the hex address in R0
+       MOV  R6,R7             * Don't change R6 (display location)
+       MOV  R0,R8
+       SRA  R8,12
+       ANDI R8,>000F
+       MOVB @GMSG0(R8),*R7+
+       MOV  R0,R8
+       SRA  R8,8
+       ANDI R8,>000F
+       MOVB @GMSG0(R8),*R7+
+       MOV  R0,R8
+       SRA  R8,4
+       ANDI R8,>000F
+       MOVB @GMSG0(R8),*R7+
+       MOV  R0,R8
+       ANDI R8,>000F
+       MOVB @GMSG0(R8),*R7+
+       RSTK
+*// DSPHEX
+
+
+**
+* Sector Erase
+* Erase one or more 64K sectors
+* Destroys R0
+* R1 = first sector (>00 to >0F) to erase in MSB
+* R2 = number of sectors
+* Destroys R3
+* R6 = location where sector can be displayed
+SERASE
+ERS_LP
+       LI   R3,CMD_WE
+       DATA CSON              * SPI Chip Enable
+       LDCR R3,8              * Send Write Enable command
+       DATA CSOFF             * SPI Chip Disable
+
+       LI   R3,CMD_SE         * Send Sector Erase command
+       DATA CSON              * SPI Chip Enable
+       LDCR R3,8
+       LDCR R1,8              * Send sector number as 1st byte in 24-bit address
+       CLR  R0
+       LDCR R0,8              * Send >00
+       LDCR R0,8              * Send >00 as LSB of 24-bit address
+       DATA CSOFF             * SPI Chip Disable
+
+*      Wait until the sector erase is finished
+       CLR  R3
+       MOV  R1,R3             * Sector being erased is in MSB of R1
+       SWPB R3                * Move to LSB of R5 for table addressing
+       MOVB @GMSG0(R3),*R6+   * Convert to HEX digit and display
+
+       BSTK @SPISTS           * Call using stack
+
+       AI   R1,>0100          * Next sector in 24-bit address >0n0000
+       DEC  R2
+       JNE  ERS_LP
+
+       RSTK                   * Return using stack
+*// SERASE
+
+
+**
+* Block Write
+* Write a block of data.  Blocks MUST BE multiple of 256 bytes (one SPI page).
+* R0 = SPI page (0 to 4095) to begin writing >0ppp00
+* R1 = Buffer to write
+* R2 = Length of data to write
+* Destroys R3
+BWRITE
+       BSTK @DSPHEX           * Shows the number in R0 as hex
+
+       LI   R3,CMD_WE
+       DATA CSON              * SPI Chip Enable
+       LDCR R3,8              * Send Write Enable command
+       DATA CSOFF             * SPI Chip Disable
+
+       LI   R3,CMD_PP
+       DATA CSON              * SPI Chip Enable
+       LDCR R3,8              * Send Page Program command
+       LDCR R0,8              * Send MSB of page address
+       SWPB R0
+       LDCR R0,8              * Send next byte of address
+       SWPB R0                * Restore R0 for multiple page writes
+       CLR  R3
+       LDCR R3,8              * Send LSB of address, always >00
+
+       LI   R3,256            * Each SPI page is 256 bytes
+WRT_LP
+       LDCR *R1+,8            * Send a byte of data
+       DEC  R2
+       JEQ  WRTEND            * Done with block
+       DEC  R3                * Count the data in the current block
+       JNE  WRT_LP            * More data in this page
+
+*      Current page is done, so disable the SPI and wait for the page
+*      write to commit.
+WRTEND
+       DATA CSOFF             * SPI Chip Disable
+       INCT R6
+       BSTK @SPISTS
+       DECT R6
+       INC  R0                * Next page >0ppp00
+       MOV  R2,R2             * Test if the data is done or if only the current block was done
+       JNE  BWRITE            * More data, start next page
+
+       RSTK                   * Return using stack
+*// BWRITE
+
+
+**
+* Block Read
+* Read a block of data.  Blocks MUST BE multiple of 256 bytes (one SPI page).
+* R0 = SPI page (0 to 4095) to begin reading >0ppp00
+* R1 = Buffer to read into
+* R2 = Length of data to read
+* Destroys R3
+BREAD
+       LI   R3,CMD_RD
+       DATA CSON              * SPI Chip Enable
+       LDCR R3,8              * Send fast read command
+       LDCR R0,8              * Send MSB of 24-bit page address
+       SWPB R0
+       LDCR R0,8              * Next address byte
+       SWPB R0                * Restore R0
+       CLR  R3
+       LDCR R3,8              * Send LSB of address, always >00
+       STCR R3,8              * Consume fast read dummy byte
+RD_LP  STCR *R1+,8            * Read a byte into the specified buffer
+       DEC  R2
+       JNE  RD_LP
+
+       DATA CSOFF             * SPI Chip Disable
+       RSTK                   * Return using stack
+*// BREAD
+
+
+**
+* SPI Status Check
+* Wait for a write or erase command to finish
+* Destroys R3
+* R6 = Address in VRAM where an indicator can be displayed
+* Destroys R7
+* Destroys R8
+SPISTS
+       LI   R3,CMD_RS
+       DATA CSON              * SPI Chip Enable
+       LDCR R3,8              * Send Read Status command
+STS_LP STCR R3,8              * Read status register
+       ANDI R3,>0100          * Check if the WIP (write in progress) bit is set
+       JNE  STS_LP            * WIP == 1 when a write is in progress, so wait if set
+       DATA CSOFF             * SPI Chip Disable
+       RSTK                   * Return using stack
+*// SPISTS
+
+       EVEN
+GPUFNO DATA >0000               * GPU file number
+GPUBNO DATA >0000               * GPU block number
+GPUCRC DATA >0000               * GPU CRC of last block
+GPURES DATA >0000               * GPU result (0=Working, 1=OK, 2=Error)
+GPUEND
+
+       END

@@ -1,0 +1,1138 @@
+* F18A In-System Updater
+* TI-99/4A 512k ROM version
+* This version uses the PureGPU updater
+* code and is intended as a template
+* for porting to other systems.
+*
+* The goal is to keep the host stub as simple
+* as possible for easier porting. All you need
+* is to init your system, load the GPU code,
+* and handle input and file access.
+*
+* @author Tursi (Mike Brent)
+* @date Feb 2017
+* @version 1.7
+*
+* Based on:
+* @author Matthew Hagerty
+* @author Rasmus (lastname?)
+* @date July 2014
+* @version 1.6.2
+*
+* Follow the usual instructions to update the main code CRCs and checksum
+* in the original disk-based updater.
+*
+* Once the main program is updated, can update F18A_PureGPU.a99 (note that
+* it will have a different checksum and requires that step repeated).
+* Build F18A_PureGPU.a99 and convert the resulting object file into a raw binary.
+* Include the binary as data here (doing it this way so that it can be more
+* easily included in non-9900-based systems)
+*
+       DEF  START
+
+*      Configuration
+*      See also section at end of file
+FILE1S EQU  >6002               * First page of file 1 (166k takes 21 pages)
+FILE2S EQU  >602C               * First page of file 2 (46k takes 6 pages)
+FILE3S EQU  >6038               * First page if there was a file 3
+GPUPRG EQU  >2800               * GPU program start
+
+* Hardware interface
+VDPRD  EQU  >8800               * VDP read data
+VDPSTA EQU  >8802               * VDP status
+VDPWD  EQU  >8C00               * VDP write data
+VDPWA  EQU  >8C02               * VDP set read/write address
+KEYDEV EQU  >8374               * Keyboard device
+KEY    EQU  >8375               * Key pressed
+STATUS EQU  >837C               * Key status
+FNPNTR EQU  >8356               * File name pointer
+SCAN   EQU  >000E               * ROM keyboard scan vector
+
+*      VDP Memory Map
+NAMETB EQU  >0000               * Name table
+COLRTB EQU  >0380               * Color table
+PTRNTB EQU  >0800               * Pattern table
+SPRATB EQU  >0300               * Sprite attribute table
+SPRPTB EQU  >0800               * Sprite pattern table
+PAB    EQU  >0F00               * Peripheral address block
+PABBUF EQU  >1000               * File data buffer
+
+*      GPU Interface (all addresses in VDP)
+GPUKEY EQU  GPUPRG+2            * write keypresses here - FF means none
+GPURES EQU  GPUKEY+2            * read GPU result here - 0 means success
+GPUDSR EQU  GPURES+2            * read GPU DSR request PAB address here - 0 means none
+GPUCCK EQU  GPUDSR+2            * GPU calculated checksum
+GPUECK EQU  GPUCCK+2            * GPU expected checksum
+
+*********************************************************************
+*
+* Data section
+*
+WRKSP  EQU  >8300
+R0LB   EQU  WRKSP+1             * R0 low byte reqd for VDP routines
+R5LB   EQU  WRKSP+11            * R5 low byte used for PAB erorrs
+PABCOD EQU  WRKSP+24            * code space, overwrite R12 onward
+F18A   EQU  PABCOD+16           * F18A detected
+F18VER EQU  F18A+2              * F18A version
+STACK  EQU  F18VER+2
+
+*      Start address of host-side code
+       AORG >6000
+
+* cartridge header - we reserve 128 bytes to
+* make the data padding more consistent - so
+* the program start and CLR @>6000 must happen
+* in that first 128 bytes
+       DATA >AA01,>0200,>0000,PROG1,>0000,>0000
+PROG1  DATA >0000,START,>0B55
+       TEXT 'PDATE F18A'
+             
+START  CLR @>6000               * force first bank
+
+       LIMI 0										* no interrupts!
+       LWPI WRKSP								* for coleco we should wait for an NMI and
+       LI   R10,STACK						* then not clear it, so it can't retrigger
+*      Detect F18A
+       CLR  @F18A
+       BL   @F18ADT
+*      Graphics mode
+       BL   @GMODE
+*      Check for F18A
+       MOV  @F18A,R0
+       JNE  MAIN1
+*      Diplay error if not present
+       LI   R0,11*32+7+NAMETB   * Position
+       LI   R1,F18ERR           * Source address
+       LI   R2,17               * Length
+       BL   @VMBW
+       B    @GORED
+
+*      Copy GPU code to VDP RAM
+MAIN1  LI   R0,GPUPRG
+       LI   R1,GPUDAT
+       LI   R2,SIZE_OF_GPUDAT
+       BL   @VMBW
+
+* set the initial GPU address
+       LI   R0,GPUPRG
+       BL   @DO_GPU
+
+       CLR @KEYDEV
+
+* At this point, we just slave to the GPU
+* We need to read the keyboard and feed the code to it
+* It only cares about three keys: P (proceed), Q (quit), 0xff (none)
+
+GPULP1
+       LI   R0,>0F02          * Set the status port to read SR2
+       BL   @VWTR							* DO NOT ALLOW QUIT LIKE THIS!
+
+GPULP
+* read the keyboard and forward the result to the GPU
+       BL   @KSCAN
+       LI   R0,GPUKEY
+       MOVB @KEY,R1
+       BL   @VSBW
+             
+* see if the GPU is still running
+       MOVB @VDPSTA,R1
+       JLT  GPULP
+       
+* the GPU has stopped, restore the status register
+       LI   R0,>0F00          * Set status port to read SR0
+       BL   @VWTR
+       
+* read program status into registers
+       LI   R0,GPURES
+       LI   R1,WRKSP+10        * R5,R6,R7,R8
+       LI   R2,8
+       BL   @VMBR
+             
+* first check for error          
+       MOV  R5,R0
+       JNE  ERRRET              * something went wrong
+             
+* no error, check for a DSR request
+       MOV  R6,R0
+       JEQ  NOTDSR
+       BL   @DODSR
+       BL   @CONT_GPU           * wake the GPU back up
+       JMP  GPULP1              * loop around with status reset
+
+* then it must have been successful! Set the screen to green
+* and allow QUIT.
+NOTDSR
+       LI   R0,>0702
+       BL   @VWTR
+WQUIT
+       LI   R0,>01E2            * enable VDP interrupts so QUIT works
+       BL   @VWTR  
+WQUIT2
+       LIMI 2
+       LIMI 0
+       JMP WQUIT2
+
+* GPU returned a problem - go red       
+ERRRET
+* original code would reboot on checksum error, so we can
+* check and be a little nicer here
+       C    R7,R8
+       JEQ  GORED               * checksum passed, it was something else
+       
+       LI   R0,8*32+1
+       LI   R1,CHKERR
+       LI   R2,14
+       BL   @VMBW
+       
+GORED
+       LI   R0,>0708
+       BL   @VWTR
+       JMP  WQUIT
+       
+* GPU has requested a DSR operation
+* PAB VDP address in is R0
+DODSR
+       MOV  R11,*R10+         * Push return address onto the stack
+             
+       MOV  R0,R15            * save PAB address
+
+       LI R1,WRKSP+10         * R5=opcode/status,R6=buffer,R7=record/size,R8=rec#,R9=off/name
+       LI R2,10
+       BL @VMBR
+             
+* check close - it ignores attributes
+       CLR R0
+       MOVB R5,R0
+       CI R0,>0100
+       JNE DSRSAN
+       
+* this is just a close request, ignore it
+       B @DSRRET
+             
+* basic sanity
+DSRSAN
+       ANDI R7,>ff00
+       CI   R7,>8000
+       JEQ  DSROK1
+             
+BADOPEN          
+       LI   R0,>4000            * bad attribute
+       SOCB R0,@R5LB
+       JMP  PABOUT
+
+DSROK1
+       CI R0,>0200              * is it read?
+       JEQ DSRREAD              * yes
+             
+* if we get here, it's open or nothing, so check
+* both the command and the attributes in one
+       CI R5,>000C
+       JNE BADOPEN
+       JMP DSRRET
+             
+PABOUT           
+       MOV R15,R0
+       LI R1,WRKSP+10         * R5-R9
+       LI R2,10
+       BL @VMBW               * write it back out
+             
+DSRRET           
+       DECT R10               * Pop return address off the stack
+       MOV  *R10,R11
+       B    *R11
+             
+             
+* read a record - it should be a 128 byte block
+* for the sake of simplicity, each 8k page has
+* a 128 byte header, and then 63 128 byte records
+* no record is thus ever split across pages
+DSRREAD
+
+* first, figure out which file we're reading and
+* check whether the record is in range. Note that
+* the EOF is only accurate to within 63 records,
+* so probably isn't very helpful here. ;)
+* We destroy R9 here, so we restore it later, just in case
+* we know (assume) it's always >000C
+       MOV R15,R0
+       AI R0,19
+       LI R1,WRKSP+18         * R9 = BI or RO
+       LI R2,2
+       BL @VMBR
+             
+       CI R9,>4249
+       JEQ DFILE1
+       CI R9,>524f
+       JEQ DFILE2
+             
+* unknown filename
+       LI R0,>E000            * file error
+       SOCB R0,@R5LB
+       JMP PABOUT
+
+DFILE1
+       LI R3,FILE1S           * first record
+       LI R4,FILE2S           * next file
+       JMP RECORD
+
+DFILE2
+       LI R3,FILE2S           * first record
+       LI R4,FILE3S           * next file
+             
+RECORD
+			 LI R9,>000C            * 'restore' R9, just in case
+       MOV R8,R1              * record number
+       CLR R0                 * make 32 bit
+       LI R2,63               * records per page
+       DIV R2,R0              * figure out what page
+       A R0,R0                * double for words
+       A R3,R0                * page switch address
+       C R0,R4                * how'd we do?
+       JL RECOK
+             
+* past end of file (probably by a lot ;) )
+       LI R0,>A000
+       SOCB R0,@R5LB
+       B @PABOUT
+             
+RECOK
+* R0 has the bankswitch page, r1 has the record index
+       SLA R1,7               * multiply record by 128
+       AI R1,>6080            * address of first record
+* set the VDP address to write from R6
+       ORI R6,>4000
+       SWPB R6
+       MOVB R6,@VDPWA
+       SWPB R6
+       MOVB R6,@VDPWA
+       ANDI R6,>3FFF
+       
+* We're about to lose R15, so store it in R7
+* just overwrite R7 with a fixed value anyway
+			 MOV R15,R7
+      
+* copy the scratchpad code and execute the copy
+* overwrites R12-R20 (well, if it went that high)   
+       LI R2,PABCOD
+       LI R3,SCOPY
+       LI R4,16
+PABLP
+       MOV *R3+,*R2+
+       DECT R4
+       JNE PABLP
+
+* copy 128 bytes from another page into VDP      
+       LI R2,128
+       BL @PABCOD
+
+* copy is complete, update the PAB (not much to do, we don't have errors)
+       MOV R7,R15             * restore R15
+       INC R8                 * next record
+       LI R7,>8080            * bit of an assumption, but it'll work
+       B @PABOUT
+
+* this is copied to scratchpad and executed to get data from
+* another bank into VDP. Do not modify R5-R9.
+* VDP address is assumed to already be set up.
+* R0 - bank to select
+* R1 - ROM address of data
+* R2 - bytes to copy
+SCOPY
+       MOV R0,*R0              * switch banks
+SCLP
+       MOVB *R1+,@VDPWD
+       DEC R2
+       JNE SCLP
+       MOV R0,@>6000           * restore first bank
+       B *R11
+*// MAIN
+
+**
+* Call a GPU routine - do not wait!
+* R0 = address of GPU routine in VRAM
+*
+DO_GPU
+       MOV  R11,*R10+         * Push return address onto the stack
+
+       MOV  R0,R1             * Save R0
+       SRL  R0,8              * Move MSB to LSB
+       AI   R0,>3600          * VR36 = MSB of GPU address
+       BL   @VWTR
+
+       ANDI R1,>00FF
+       AI   R1,>3700          * VR37 = LSB of GPU address
+       MOV  R1,R0
+       BL   @VWTR
+
+       DECT R10               * Pop return address off the stack
+       MOV  *R10,R11
+       B    *R11
+*// DO_GPU
+
+**
+* Restart the GPU without setting the address
+*
+CONT_GPU
+       MOV  R11,*R10+         * Push return address onto the stack
+       LI R0,>3801            * GPU GO bit to 1
+       BL @VWTR
+       DECT R10               * Pop return address off the stack
+       MOV  *R10,R11
+       B    *R11
+*// CONT_GPU
+
+*********************************************************************
+*
+* Detect F18A
+*
+F18ADT MOV  R11,*R10+           * Push return address onto the stack
+*      F18A Unlock
+       LI   R0,>391C            * VR1/57, value 00011100
+       BL   @VWTR               * Write once
+       BL   @VWTR               * Write twice, unlock
+       LI   R0,>01E0            * VR1, value 11100000, a real sane setting
+       BL   @VWTR               * Write reg
+*      Copy GPU code to VRAM
+       LI   R0,GPUPRG
+       LI   R1,GPUDT
+       LI   R2,GPUDTE-GPUDT
+       BL   @VMBW
+*      Set the GPU PC which also triggers it
+       LI   R0,GPUPRG/256+>3600 * High byte
+       BL   @VWTR
+       LI   R0,>3700            * Low byte
+       BL   @VWTR
+*      Compare the result in GPUPRG
+       LI   R0,GPUPRG
+       BL   @VRAD
+       MOVB @VDPRD,R0
+       JEQ  F18AOK
+       CLR  @F18A
+       JMP  F18ADE
+F18AOK SETO @F18A
+*      Get the version number
+       LI   R0,>0F0E            * Choose version status reg
+       BL   @VWTR
+       CLR  R0
+       MOVB @VDPSTA,R0
+       MOV  R0,R1
+       ANDI R0,>F000
+       SRL  R0,4                * MSB - major version no
+       ANDI R1,>0F00
+       SRL  R1,8
+       SOC  R1,R0               * LSB - minor version no
+       MOV  R0,@F18VER
+       LI   R0,>0F00            * Choose ordinary status reg
+       BL   @VWTR
+F18ADE DECT R10                 * Pop return address off the stack
+       MOV  *R10,R11
+       B    *R11
+*// F18ADT
+
+GPUDT  CLR  @GPUPRG
+       IDLE
+GPUDTE
+
+*********************************************************************
+*
+* Setup graphics mode (this is a bit redundant... GPU does it too)
+*
+GMODE  MOV  R11,*R10+           * Push return address onto the stack
+       LI   R0,>0000            * Reg 0: Graphics mode I,
+       BL   @VWTR               * external video off
+       LI   R0,>01C2            * Reg 1: 16K, display on, no interrupt,
+       BL   @VWTR               * size = 1, mag = 0.
+       LI   R0,>0200            * Reg 2: Name table
+       BL   @VWTR               * NAMETB = >1800 (>06 * >400), >300 bytes
+       LI   R0,>030E            * Reg 3: Color Table
+       BL   @VWTR               * COLRTB = >0380 (>0E * >40), >20 bytes
+       LI   R0,>0401            * Reg 4: Pattern Table
+       BL   @VWTR               * PTRNTB = >0800 (>01 * >800), >800 bytes
+       LI   R0,>0506            * Reg 5: Sprite Attribute Table
+       BL   @VWTR               * SPRATB = >0300 (>06 * >80), >80 bytes
+       LI   R0,>0601            * Reg 6: Sprite Pattern Table
+       BL   @VWTR               * SPRPTB = >0800 (>01 * >800), >800 bytes
+       LI   R0,>07F4            * Reg 7: Text-mode color and backdrop color
+       BL   @VWTR               * Blue backdrop
+*      Put a copy of Reg 1 at >83D4
+       LI   R0,>C200
+       MOVB R0,@>83D4
+*      Disable sprites
+       LI   R0,SPRATB
+       LI   R1,>D000
+       BL   @VSBW
+*      Initialize color table
+       LI   R0,COLRTB
+       LI   R1,>F000                        * white on transparent
+       LI   R2,>20              * 32 bytes
+       BL   @VSMW
+*      Clear name table
+       LI   R0,NAMETB
+       LI   R1,>2000            * Space
+       LI   R2,>300             * 768 bytes
+       BL   @VSMW
+*      Load character set
+       BL   @LOADCH
+*      Return
+       DECT R10                 * Pop return address off the stack
+       MOV  *R10,R11
+       B    *R11
+*// GMODE
+
+*********************************************************************
+*
+* VDP Set Read Address
+*
+* R0   Address to set VDP address counter to
+*
+VRAD   MOVB @R0LB,@VDPWA            * Send low byte of VDP RAM write address
+       ANDI R0,>3FFF                * Make sure the two MSbits are 00 for read
+       MOVB R0,@VDPWA               * Send high byte of VDP RAM write address
+       B    *R11
+*// VRAD
+
+*********************************************************************
+*
+* VDP Single Byte Write
+*
+* R0   Write address in VDP RAM
+* R1   MSB of R1 sent to VDP RAM
+*
+* R0 is modified, but can be restored with: ANDI R0,>3FFF
+*
+VSBW   MOVB @R0LB,@VDPWA        * Send low byte of VDP RAM write address
+       ORI  R0,>4000            * Set read/write bits 14 and 15 to write (01)
+       MOVB R0,@VDPWA           * Send high byte of VDP RAM write address
+       MOVB R1,@VDPWD           * Write byte to VDP RAM
+       B    *R11
+*// VSBW
+
+*********************************************************************
+*
+* VDP Single Byte Multiple Write
+*
+* R0   Starting write address in VDP RAM
+* R1   MSB of R1 sent to VDP RAM
+* R2   Number of times to write the MSB byte of R1 to VDP RAM
+*
+* R0 is modified, but can be restored with: ANDI R0,>3FFF
+*
+VSMW   MOVB @R0LB,@VDPWA        * Send low byte of VDP RAM write address
+       ORI  R0,>4000            * Set read/write bits 14 and 15 to write (01)
+       MOVB R0,@VDPWA           * Send high byte of VDP RAM write address
+VSMWLP MOVB R1,@VDPWD           * Write byte to VDP RAM
+       DEC  R2                  * Byte counter
+       JNE  VSMWLP              * Check if done
+       B    *R11
+*// VSMW
+
+*********************************************************************
+*
+* VDP Multiple Byte Write
+*
+* R0   Starting write address in VDP RAM
+* R1   Starting read address in CPU RAM
+* R2   Number of bytes to send to the VDP RAM
+*
+* R0 is modified, but can be restored with: ANDI R0,>3FFF
+*
+VMBW   MOVB @R0LB,@VDPWA        * Send low byte of VDP RAM write address
+       ORI  R0,>4000            * Set read/write bits 14 and 15 to write (01)
+       MOVB R0,@VDPWA           * Send high byte of VDP RAM write address
+VMBWLP MOVB *R1+,@VDPWD         * Write byte to VDP RAM
+       DEC  R2                  * Byte counter
+       JNE  VMBWLP              * Check if done
+       B    *R11
+*// VMBW
+
+*********************************************************************
+*
+* VDP Multiple Byte Read
+*
+* R0   Starting read address in VDP RAM
+* R1   Starting write address in CPU RAM
+* R2   Number of bytes to read from VDP RAM
+*
+VMBR   MOVB @R0LB,@VDPWA        * Send low byte of VDP RAM write address
+       MOVB R0,@VDPWA           * Send high byte of VDP RAM write address
+VMBRLP MOVB @VDPRD,*R1+         * Read byte from VDP RAM
+       DEC  R2                  * Byte counter
+       JNE  VMBRLP              * Check if finished
+       B    *R11
+*// VMBR
+
+*********************************************************************
+*
+* VDP Write To Register
+*
+* R0 MSB    VDP register to write to
+* R0 LSB    Value to write
+*
+VWTR   MOVB @R0LB,@VDPWA        * Send low byte (value) to write to VDP register
+       ORI  R0,>8000            * Set up a VDP register write operation (10)
+       MOVB R0,@VDPWA           * Send high byte (address) of VDP register
+       B    *R11
+*// VWTR
+
+*********************************************************************
+*
+* KSCAN wrapper
+*
+KSCAN  
+       MOV  R11,*R10+         * Push return address onto the stack
+       LWPI >83E0
+       BL   @SCAN
+       LWPI WRKSP
+       DECT R10               * Pop return address off the stack
+       MOV  *R10,R11
+       B    *R11
+*// KSCAN
+
+*********************************************************************
+* load the character set to PDT. First char is 30,
+* PDT is at >0800 (or will be), so we need to load
+* to >08F0
+LOADCH
+       LI   R0,>08F0 * write address
+       LI   R1,CHARS
+       LI   R2,>0308
+       B    @VMBW
+
+
+*      Text
+F18ERR TEXT "F18A NOT DETECTED"
+CHKERR TEXT "CHECKSUM ERROR"
+
+*      Configuration
+FILEL1 EQU  7
+FILEN1 TEXT "F18ABIN"
+FILEL2 EQU  7
+FILEN2 TEXT "F18AROM"
+       EVEN
+
+CHARS
+    DATA >7070,>7070,>7070,>7000,>BFBF,>A3AF,>E3EF,>EFFF
+    DATA >0000,>0000,>0000,>0000,>1010,>1010,>1000,>1000
+    DATA >2828,>2800,>0000,>0000,>0028,>7C28,>287C,>2800
+    DATA >103C,>5038,>1478,>1000,>0044,>4C18,>3064,>4400
+    DATA >0020,>5020,>5448,>3400,>0810,>2000,>0000,>0000
+    DATA >0810,>2020,>2010,>0800,>2010,>0808,>0810,>2000
+    DATA >4428,>7C28,>4400,>0000,>0010,>107C,>1010,>0000
+    DATA >0000,>0000,>0030,>1020,>0000,>007C,>0000,>0000
+    DATA >0000,>0000,>0030,>3000,>0004,>0810,>2040,>0000
+    DATA >3844,>4C54,>5464,>3800,>1030,>1010,>1010,>3800
+    DATA >3844,>4408,>1020,>7C00,>7C08,>1008,>0444,>3800
+    DATA >0818,>2848,>7C08,>0800,>7840,>4078,>0444,>3800
+    DATA >3840,>4078,>4444,>3800,>7C04,>0408,>1020,>2000
+    DATA >3844,>4438,>4444,>3800,>3844,>4444,>3C04,>7800
+    DATA >0000,>3030,>0030,>3000,>0000,>3030,>0030,>1020
+    DATA >0000,>1020,>4020,>1000,>0000,>007C,>007C,>0000
+    DATA >0000,>1008,>0408,>1000,>0038,>4408,>1000,>1000
+    DATA >0038,>4454,>5840,>3C00,>3844,>447C,>4444,>4400
+    DATA >7844,>4478,>4444,>7800,>3844,>4040,>4044,>3800
+    DATA >7844,>4444,>4444,>7800,>7C40,>4078,>4040,>7C00
+    DATA >7C40,>4078,>4040,>4000,>3844,>4440,>4C44,>3800
+    DATA >4444,>447C,>4444,>4400,>3810,>1010,>1010,>3800
+    DATA >0404,>0404,>0444,>3800,>4448,>5070,>4844,>4400
+    DATA >4040,>4040,>4040,>7C00,>446C,>5444,>4444,>4400
+    DATA >4444,>6454,>4C44,>4400,>3844,>4444,>4444,>3800
+    DATA >7844,>4444,>7840,>4000,>3844,>4444,>544C,>3C00
+    DATA >7844,>4478,>5048,>4400,>3C40,>4038,>0404,>7800
+    DATA >7C10,>1010,>1010,>1000,>4444,>4444,>4444,>3800
+    DATA >4444,>4444,>4428,>1000,>4444,>4444,>5454,>2800
+    DATA >4444,>2810,>1028,>4400,>4444,>4428,>1010,>1000
+    DATA >7C04,>0810,>2040,>7C00,>0038,>2020,>2020,>3800
+    DATA >0000,>4020,>1008,>0400,>0038,>0808,>0808,>3800
+    DATA >0010,>2844,>0000,>0000,>0000,>0000,>0000,>7C00
+* 96 (lowercase)
+    DATA >2010,>0800,>0000,>0000,>0000,>3804,>3C44,>3C00
+    DATA >4040,>7844,>4444,>7800,>0000,>3844,>4040,>3800
+    DATA >0404,>3C44,>4444,>3C00,>0000,>3844,>7C40,>3800
+    DATA >0C10,>3810,>1010,>1000,>0000,>3C44,>443C,>0438
+    DATA >4040,>7844,>4444,>4400,>1000,>1010,>1010,>3800
+    DATA >0800,>0808,>0808,>4830,>4040,>4448,>7048,>4400
+    DATA >3010,>1010,>1010,>3800,>0000,>6854,>5454,>5400
+    DATA >0000,>5864,>4444,>4400,>0000,>3844,>4444,>3800
+    DATA >0000,>7844,>4444,>7840,>0000,>3C44,>4444,>3C04
+    DATA >0000,>2834,>2020,>2000,>0000,>3C40,>3804,>7800
+    DATA >0010,>3810,>1010,>0C00,>0000,>4444,>444C,>3400
+    DATA >0000,>4444,>4428,>1000,>0000,>5454,>5454,>2800
+    DATA >0000,>4428,>1028,>4400,>0000,>4444,>443C,>0438
+    DATA >0000,>7C08,>1020,>7C00,>000C,>1010,>2010,>100C
+    DATA >0010,>1010,>0010,>1010,>0060,>1010,>0810,>1060
+    DATA >0000,>2054,>0800,>0000
+* 122 is last
+
+*-------------------------------------------------------------------
+
+*
+* Data file F18A_PureGPU.bin - Mar 05, 2017
+*
+
+GPUDAT
+  BYTE >10,>25,>FF,>FF,>00,>00,>00,>00  * 00000000 .%......
+  BYTE >00,>00,>63,>55,>00,>00,>00,>00  * 00000008 ..cU....
+  BYTE >00,>00,>00,>00,>00,>00,>00,>00  * 00000010 ........
+  BYTE >00,>00,>00,>00,>00,>00,>00,>00  * 00000018 ........
+  BYTE >00,>00,>00,>00,>00,>00,>00,>00  * 00000020 ........
+  BYTE >00,>00,>00,>00,>00,>00,>00,>00  * 00000028 ........
+  BYTE >00,>00,>00,>00,>00,>00,>00,>00  * 00000030 ........
+  BYTE >00,>00,>00,>00,>00,>00,>00,>00  * 00000038 ........
+  BYTE >00,>00,>00,>00,>00,>00,>00,>00  * 00000040 ........
+  BYTE >00,>00,>00,>00,>02,>00,>28,>4C  * 00000048 ......(L
+  BYTE >04,>C1,>02,>02,>05,>2E,>A0,>70  * 00000050 .......p
+  BYTE >06,>02,>16,>FD,>02,>00,>32,>A8  * 00000058 ......2.
+  BYTE >02,>02,>01,>D2,>A0,>70,>06,>02  * 00000060 .....p..
+  BYTE >16,>FD,>C8,>01,>28,>08,>02,>0A  * 00000068 ....(...
+  BYTE >37,>40,>06,>A0,>2E,>C0,>06,>A0  * 00000070 7@......
+  BYTE >2E,>E2,>02,>00,>00,>00,>C0,>60  * 00000078 .......`
+  BYTE >28,>08,>06,>A0,>29,>7A,>C0,>60  * 00000080 (...)z.`
+  BYTE >28,>08,>88,>01,>28,>0A,>16,>6A  * 00000088 (...(..j
+  BYTE >07,>20,>28,>02,>04,>E0,>28,>04  * 00000090 . (...(.
+  BYTE >04,>E0,>28,>06,>02,>00,>0A,>00  * 00000098 ..(.....
+  BYTE >C8,>00,>33,>4C,>04,>E0,>33,>4E  * 000000A0 ..3L..3N
+  BYTE >02,>00,>06,>00,>C8,>00,>33,>50  * 000000A8 ......3P
+  BYTE >04,>E0,>36,>44,>04,>E0,>36,>46  * 000000B0 ..6D..6F
+  BYTE >04,>E0,>36,>48,>04,>E0,>36,>4A  * 000000B8 ..6H..6J
+  BYTE >02,>00,>31,>C4,>02,>02,>00,>07  * 000000C0 ..1.....
+  BYTE >06,>A0,>2D,>9E,>C0,>00,>16,>4A  * 000000C8 ..-....J
+  BYTE >02,>00,>31,>CC,>02,>02,>00,>07  * 000000D0 ..1.....
+  BYTE >06,>A0,>2D,>9E,>C0,>00,>16,>42  * 000000D8 ..-....B
+  BYTE >06,>A0,>2A,>2A,>C0,>00,>16,>3C  * 000000E0 ..**...<
+  BYTE >06,>A0,>2E,>4E,>02,>00,>01,>01  * 000000E8 ...N....
+  BYTE >02,>01,>2F,>F4,>02,>02,>00,>1D  * 000000F0 ../.....
+  BYTE >06,>A0,>2F,>6A,>06,>A0,>2A,>DA  * 000000F8 ../j..*.
+  BYTE >02,>00,>32,>A8,>06,>A0,>29,>F4  * 00000100 ..2...).
+  BYTE >06,>A0,>2B,>0C,>C0,>00,>16,>2A  * 00000108 ..+....*
+  BYTE >06,>A0,>2B,>44,>C0,>00,>16,>26  * 00000110 ..+D...&
+  BYTE >02,>00,>33,>52,>06,>A0,>29,>F4  * 00000118 ..3R..).
+  BYTE >06,>A0,>2B,>D6,>C0,>00,>16,>BA  * 00000120 ..+.....
+  BYTE >02,>00,>32,>D4,>06,>A0,>29,>F4  * 00000128 ..2...).
+  BYTE >02,>00,>01,>00,>02,>01,>20,>00  * 00000130 ...... .
+  BYTE >02,>02,>00,>40,>06,>A0,>2F,>62  * 00000138 ...@../b
+  BYTE >02,>00,>01,>04,>02,>01,>30,>12  * 00000140 ......0.
+  BYTE >02,>02,>00,>17,>06,>A0,>2F,>6A  * 00000148 ....../j
+  BYTE >02,>00,>01,>24,>02,>01,>30,>2A  * 00000150 ...$..0*
+  BYTE >02,>02,>00,>17,>06,>A0,>2F,>6A  * 00000158 ....../j
+  BYTE >03,>40,>10,>FE,>07,>20,>28,>04  * 00000160 .@... (.
+  BYTE >10,>FB,>30,>31,>32,>33,>34,>35  * 00000168 ..012345
+  BYTE >36,>37,>38,>39,>41,>42,>43,>44  * 00000170 6789ABCD
+  BYTE >45,>46,>C0,>81,>02,>42,>F0,>00  * 00000178 EF...B..
+  BYTE >09,>C2,>DC,>22,>29,>6A,>C0,>81  * 00000180 ...")j..
+  BYTE >02,>42,>0F,>00,>09,>82,>DC,>22  * 00000188 .B....."
+  BYTE >29,>6A,>C0,>81,>02,>42,>00,>F0  * 00000190 )j...B..
+  BYTE >09,>42,>DC,>22,>29,>6A,>C0,>81  * 00000198 .B.")j..
+  BYTE >02,>42,>00,>0F,>DC,>22,>29,>6A  * 000001A0 .B...")j
+  BYTE >04,>5B,>05,>C0,>CC,>01,>CC,>02  * 000001A8 .[......
+  BYTE >CC,>03,>CC,>04,>CC,>05,>CC,>06  * 000001B0 ........
+  BYTE >CC,>07,>CC,>08,>CC,>09,>CC,>0A  * 000001B8 ........
+  BYTE >05,>C0,>CC,>0C,>CC,>0D,>CC,>0E  * 000001C0 ........
+  BYTE >C4,>0F,>04,>5B,>05,>C0,>C0,>70  * 000001C8 ...[...p
+  BYTE >C0,>B0,>C0,>F0,>C1,>30,>C1,>70  * 000001D0 .....0.p
+  BYTE >C1,>B0,>C1,>F0,>C2,>30,>C2,>70  * 000001D8 .....0.p
+  BYTE >C2,>B0,>05,>C0,>C3,>30,>C3,>70  * 000001E0 .....0.p
+  BYTE >C3,>B0,>C3,>D0,>02,>20,>FF,>E2  * 000001E8 ..... ..
+  BYTE >C0,>10,>04,>5B,>CE,>8B,>C8,>00  * 000001F0 ...[....
+  BYTE >28,>0C,>02,>00,>28,>0C,>06,>A0  * 000001F8 (...(...
+  BYTE >29,>AA,>02,>00,>28,>2C,>06,>A0  * 00000200 )...(,..
+  BYTE >29,>CC,>C2,>E0,>28,>0C,>06,>9B  * 00000208 )...(...
+  BYTE >C8,>00,>28,>2C,>02,>00,>28,>2C  * 00000210 ..(,..(,
+  BYTE >06,>A0,>29,>AA,>02,>00,>28,>0C  * 00000218 ..)...(.
+  BYTE >06,>A0,>29,>CC,>06,>4A,>C2,>DA  * 00000220 ..)..J..
+  BYTE >04,>5B,>CE,>8B,>02,>00,>00,>46  * 00000228 .[.....F
+  BYTE >02,>01,>2F,>A6,>02,>02,>00,>14  * 00000230 ../.....
+  BYTE >06,>A0,>2F,>6A,>02,>00,>01,>00  * 00000238 ../j....
+  BYTE >02,>01,>20,>00,>02,>02,>00,>40  * 00000240 .. ....@
+  BYTE >06,>A0,>2F,>62,>02,>00,>01,>07  * 00000248 ../b....
+  BYTE >02,>01,>2F,>D6,>02,>02,>00,>12  * 00000250 ../.....
+  BYTE >06,>A0,>2F,>6A,>02,>00,>01,>2A  * 00000258 ../j...*
+  BYTE >02,>01,>2F,>E8,>02,>02,>00,>0C  * 00000260 ../.....
+  BYTE >06,>A0,>2F,>6A,>02,>00,>00,>88  * 00000268 ../j....
+  BYTE >02,>01,>2F,>BA,>02,>02,>00,>0E  * 00000270 ../.....
+  BYTE >06,>A0,>2F,>6A,>C0,>A0,>2F,>7A  * 00000278 ../j../z
+  BYTE >06,>A0,>2A,>F2,>02,>00,>00,>A8  * 00000280 ..*.....
+  BYTE >02,>01,>2F,>C8,>02,>02,>00,>0E  * 00000288 ../.....
+  BYTE >06,>A0,>2F,>6A,>02,>02,>01,>08  * 00000290 ../j....
+  BYTE >06,>A0,>2A,>F2,>07,>20,>28,>02  * 00000298 ..*.. (.
+  BYTE >98,>20,>30,>C2,>28,>02,>13,>07  * 000002A0 . 0.(...
+  BYTE >98,>20,>30,>C3,>28,>02,>13,>01  * 000002A8 . 0.(...
+  BYTE >10,>F7,>07,>00,>10,>03,>06,>A0  * 000002B0 ........
+  BYTE >2A,>C2,>04,>C0,>06,>4A,>C2,>DA  * 000002B8 *....J..
+  BYTE >04,>5B,>CE,>8B,>02,>00,>01,>00  * 000002C0 .[......
+  BYTE >02,>01,>20,>00,>02,>02,>00,>C0  * 000002C8 .. .....
+  BYTE >06,>A0,>2F,>62,>06,>4A,>C2,>DA  * 000002D0 ../b.J..
+  BYTE >04,>5B,>CE,>8B,>02,>00,>01,>C0  * 000002D8 .[......
+  BYTE >02,>01,>20,>00,>02,>02,>00,>E0  * 000002E0 .. .....
+  BYTE >06,>A0,>2F,>62,>06,>4A,>C2,>DA  * 000002E8 ../b.J..
+  BYTE >04,>5B,>C0,>42,>02,>21,>30,>00  * 000002F0 .[.B.!0.
+  BYTE >DC,>01,>02,>01,>2E,>00,>DC,>01  * 000002F8 ........
+  BYTE >C0,>42,>06,>C1,>02,>21,>30,>00  * 00000300 .B...!0.
+  BYTE >DC,>01,>04,>5B,>CE,>8B,>02,>00  * 00000308 ...[....
+  BYTE >00,>01,>C8,>00,>2F,>86,>04,>E0  * 00000310 ..../...
+  BYTE >2F,>84,>02,>00,>31,>D4,>C8,>00  * 00000318 /...1...
+  BYTE >2F,>88,>02,>00,>00,>53,>C8,>00  * 00000320 /....S..
+  BYTE >2F,>7C,>02,>00,>2B,>7C,>C8,>00  * 00000328 /|..+|..
+  BYTE >2F,>80,>02,>00,>31,>C4,>02,>02  * 00000330 /...1...
+  BYTE >00,>07,>06,>A0,>2C,>92,>06,>4A  * 00000338 ....,..J
+  BYTE >C2,>DA,>04,>5B,>CE,>8B,>02,>00  * 00000340 ...[....
+  BYTE >00,>02,>C8,>00,>2F,>86,>04,>E0  * 00000348 ..../...
+  BYTE >2F,>84,>02,>00,>32,>7A,>C8,>00  * 00000350 /...2z..
+  BYTE >2F,>88,>02,>00,>00,>17,>C8,>00  * 00000358 /.......
+  BYTE >2F,>7C,>02,>00,>2B,>7C,>C8,>00  * 00000360 /|..+|..
+  BYTE >2F,>80,>02,>00,>31,>CC,>02,>02  * 00000368 /...1...
+  BYTE >00,>07,>06,>A0,>2C,>92,>06,>4A  * 00000370 ....,..J
+  BYTE >C2,>DA,>04,>5B,>CE,>8B,>05,>A0  * 00000378 ...[....
+  BYTE >2F,>8A,>06,>A0,>2E,>6A,>C8,>20  * 00000380 /....j. 
+  BYTE >2F,>86,>36,>44,>C8,>20,>2F,>84  * 00000388 /.6D. /.
+  BYTE >36,>46,>C0,>60,>2F,>84,>0A,>11  * 00000390 6F.`/...
+  BYTE >A0,>60,>2F,>88,>C8,>11,>36,>48  * 00000398 .`/...6H
+  BYTE >04,>E0,>36,>4A,>02,>00,>32,>F4  * 000003A0 ..6J..2.
+  BYTE >06,>A0,>29,>F4,>C0,>60,>36,>4A  * 000003A8 ..)..`6J
+  BYTE >02,>81,>00,>01,>13,>0A,>02,>00  * 000003B0 ........
+  BYTE >01,>69,>02,>01,>30,>6F,>02,>02  * 000003B8 .i..0o..
+  BYTE >00,>09,>06,>A0,>2F,>6A,>07,>00  * 000003C0 ..../j..
+  BYTE >10,>01,>04,>C0,>05,>A0,>2F,>84  * 000003C8 ....../.
+  BYTE >06,>4A,>C2,>DA,>04,>5B,>CE,>8B  * 000003D0 .J...[..
+  BYTE >06,>A0,>2E,>4E,>02,>00,>00,>01  * 000003D8 ...N....
+  BYTE >C8,>00,>2F,>86,>C8,>20,>2F,>86  * 000003E0 ../.. /.
+  BYTE >36,>44,>04,>E0,>2F,>84,>02,>00  * 000003E8 6D../...
+  BYTE >00,>A6,>08,>10,>C8,>00,>2F,>7C  * 000003F0 ....../|
+  BYTE >02,>00,>31,>D4,>C8,>00,>2F,>88  * 000003F8 ..1.../.
+  BYTE >06,>A0,>2C,>36,>C0,>00,>16,>14  * 00000400 ..,6....
+  BYTE >02,>00,>00,>02,>C8,>00,>2F,>86  * 00000408 ....../.
+  BYTE >C8,>20,>2F,>86,>36,>44,>04,>E0  * 00000410 . /.6D..
+  BYTE >2F,>84,>02,>00,>00,>2E,>08,>10  * 00000418 /.......
+  BYTE >C8,>00,>2F,>7C,>02,>00,>32,>7A  * 00000420 ../|..2z
+  BYTE >C8,>00,>2F,>88,>06,>A0,>2C,>36  * 00000428 ../...,6
+  BYTE >06,>4A,>C2,>DA,>04,>5B,>CE,>8B  * 00000430 .J...[..
+  BYTE >05,>A0,>2F,>8A,>06,>A0,>2E,>6A  * 00000438 ../....j
+  BYTE >C8,>20,>2F,>84,>36,>46,>C0,>60  * 00000440 . /.6F.`
+  BYTE >2F,>88,>C8,>11,>36,>48,>04,>E0  * 00000448 /...6H..
+  BYTE >36,>4A,>02,>00,>33,>B6,>06,>A0  * 00000450 6J..3...
+  BYTE >29,>F4,>C0,>60,>36,>4A,>02,>81  * 00000458 )..`6J..
+  BYTE >00,>01,>16,>09,>05,>A0,>2F,>84  * 00000460 ....../.
+  BYTE >05,>E0,>2F,>88,>06,>20,>2F,>7C  * 00000468 ../.. /|
+  BYTE >16,>E3,>04,>C0,>10,>0B,>06,>A0  * 00000470 ........
+  BYTE >2A,>C2,>02,>00,>01,>60,>02,>01  * 00000478 *....`..
+  BYTE >30,>7D,>02,>02,>00,>40,>06,>A0  * 00000480 0}...@..
+  BYTE >2F,>6A,>07,>00,>06,>4A,>C2,>DA  * 00000488 /j...J..
+  BYTE >04,>5B,>CE,>8B,>C0,>42,>02,>21  * 00000490 .[...B.!
+  BYTE >00,>05,>C8,>01,>2F,>94,>02,>01  * 00000498 ..../...
+  BYTE >2F,>9B,>DC,>70,>06,>02,>16,>FD  * 000004A0 /..p....
+  BYTE >02,>00,>20,>00,>02,>81,>2F,>A6  * 000004A8 .. .../.
+  BYTE >13,>02,>DC,>40,>10,>FB,>02,>00  * 000004B0 ...@....
+  BYTE >0F,>00,>02,>01,>2F,>8C,>02,>02  * 000004B8 ..../...
+  BYTE >00,>1A,>06,>A0,>2F,>6A,>02,>00  * 000004C0 ..../j..
+  BYTE >0F,>00,>C8,>00,>28,>06,>03,>40  * 000004C8 ....(..@
+  BYTE >04,>E0,>28,>06,>D0,>60,>0F,>01  * 000004D0 ..(..`..
+  BYTE >02,>41,>E0,>00,>16,>41,>02,>01  * 000004D8 .A...A..
+  BYTE >02,>00,>D8,>01,>0F,>00,>02,>00  * 000004E0 ........
+  BYTE >00,>10,>C8,>00,>2F,>7E,>02,>00  * 000004E8 ..../~..
+  BYTE >10,>00,>C8,>00,>2F,>82,>04,>C1  * 000004F0 ..../...
+  BYTE >02,>02,>08,>00,>06,>A0,>2F,>62  * 000004F8 ....../b
+  BYTE >C8,>20,>2F,>82,>0F,>02,>02,>00  * 00000500 . /.....
+  BYTE >0F,>00,>C8,>00,>28,>06,>03,>40  * 00000508 ....(..@
+  BYTE >04,>E0,>28,>06,>D0,>60,>0F,>01  * 00000510 ..(..`..
+  BYTE >02,>41,>E0,>00,>16,>21,>D0,>60  * 00000518 .A...!.`
+  BYTE >0F,>05,>02,>81,>80,>00,>16,>1C  * 00000520 ........
+  BYTE >02,>00,>00,>80,>A8,>00,>2F,>82  * 00000528 ....../.
+  BYTE >06,>20,>2F,>7E,>16,>E5,>C0,>20  * 00000530 . /~... 
+  BYTE >2F,>80,>06,>90,>C0,>00,>16,>2C  * 00000538 /......,
+  BYTE >06,>20,>2F,>7C,>16,>D0,>02,>01  * 00000540 . /|....
+  BYTE >01,>00,>D8,>01,>0F,>00,>02,>00  * 00000548 ........
+  BYTE >0F,>00,>C8,>00,>28,>06,>03,>40  * 00000550 ....(..@
+  BYTE >04,>E0,>28,>06,>04,>C0,>10,>1C  * 00000558 ..(.....
+  BYTE >09,>51,>02,>81,>05,>00,>16,>0B  * 00000560 .Q......
+  BYTE >88,>20,>30,>BE,>2F,>7C,>16,>07  * 00000568 . 0./|..
+  BYTE >C0,>20,>2F,>80,>06,>90,>C0,>00  * 00000570 . /.....
+  BYTE >16,>0F,>04,>C0,>10,>0D,>02,>21  * 00000578 .......!
+  BYTE >30,>00,>D8,>01,>30,>4D,>02,>00  * 00000580 0...0M..
+  BYTE >01,>4A,>02,>01,>30,>42,>02,>02  * 00000588 .J..0B..
+  BYTE >00,>0C,>06,>A0,>2F,>6A,>07,>00  * 00000590 ..../j..
+  BYTE >06,>4A,>C2,>DA,>04,>5B,>CE,>8B  * 00000598 .J...[..
+  BYTE >C0,>42,>02,>21,>00,>05,>C8,>01  * 000005A0 .B.!....
+  BYTE >2F,>94,>02,>01,>2F,>9B,>DC,>70  * 000005A8 /.../..p
+  BYTE >06,>02,>16,>FD,>02,>00,>20,>00  * 000005B0 ...... .
+  BYTE >02,>81,>2F,>A6,>13,>02,>DC,>40  * 000005B8 ../....@
+  BYTE >10,>FB,>02,>00,>0F,>00,>02,>01  * 000005C0 ........
+  BYTE >2F,>8C,>02,>02,>00,>1A,>06,>A0  * 000005C8 /.......
+  BYTE >2F,>6A,>02,>00,>0F,>00,>C8,>00  * 000005D0 /j......
+  BYTE >28,>06,>03,>40,>04,>E0,>28,>06  * 000005D8 (..@..(.
+  BYTE >D0,>60,>0F,>01,>02,>41,>E0,>00  * 000005E0 .`...A..
+  BYTE >16,>0D,>02,>01,>01,>00,>D8,>01  * 000005E8 ........
+  BYTE >0F,>00,>02,>00,>0F,>00,>C8,>00  * 000005F0 ........
+  BYTE >28,>06,>03,>40,>04,>E0,>28,>06  * 000005F8 (..@..(.
+  BYTE >04,>C0,>10,>22,>09,>51,>C0,>C1  * 00000600 ...".Q..
+  BYTE >02,>21,>30,>00,>D8,>01,>30,>4D  * 00000608 .!0...0M
+  BYTE >02,>00,>01,>4A,>02,>01,>30,>42  * 00000610 ...J..0B
+  BYTE >02,>02,>00,>0C,>06,>A0,>2F,>6A  * 00000618 ....../j
+  BYTE >02,>83,>07,>00,>16,>10,>02,>00  * 00000620 ........
+  BYTE >01,>82,>02,>01,>30,>4E,>02,>02  * 00000628 ....0N..
+  BYTE >00,>0F,>06,>A0,>2F,>6A,>02,>00  * 00000630 ..../j..
+  BYTE >01,>91,>02,>01,>2F,>96,>C0,>A0  * 00000638 ..../...
+  BYTE >2F,>94,>06,>A0,>2F,>6A,>07,>00  * 00000640 /.../j..
+  BYTE >06,>4A,>C2,>DA,>04,>5B,>CE,>8B  * 00000648 .J...[..
+  BYTE >04,>E0,>2F,>8A,>02,>00,>02,>A0  * 00000650 ../.....
+  BYTE >02,>01,>31,>64,>02,>02,>00,>60  * 00000658 ..1d...`
+  BYTE >06,>A0,>2F,>6A,>06,>4A,>C2,>DA  * 00000660 ../j.J..
+  BYTE >04,>5B,>CE,>8B,>02,>03,>00,>F0  * 00000668 .[......
+  BYTE >38,>E0,>2F,>8A,>02,>00,>00,>6A  * 00000670 8./....j
+  BYTE >3C,>C0,>02,>00,>02,>C1,>02,>01  * 00000678 <.......
+  BYTE >07,>00,>C0,>83,>08,>32,>13,>03  * 00000680 .....2..
+  BYTE >DC,>01,>06,>02,>16,>FD,>C0,>43  * 00000688 .......C
+  BYTE >02,>41,>00,>07,>13,>04,>06,>01  * 00000690 .A......
+  BYTE >06,>C1,>DC,>01,>07,>01,>08,>33  * 00000698 .......3
+  BYTE >02,>02,>00,>1E,>60,>83,>C0,>41  * 000006A0 ....`..A
+  BYTE >13,>01,>06,>02,>C0,>82,>13,>05  * 000006A8 ........
+  BYTE >02,>01,>20,>00,>DC,>01,>06,>02  * 000006B0 .. .....
+  BYTE >16,>FD,>06,>4A,>C2,>DA,>04,>5B  * 000006B8 ...J...[
+  BYTE >CE,>8B,>04,>C0,>D0,>20,>A0,>00  * 000006C0 ..... ..
+  BYTE >C0,>40,>02,>40,>F0,>00,>09,>40  * 000006C8 .@.@...@
+  BYTE >02,>41,>0F,>00,>09,>81,>E0,>01  * 000006D0 .A......
+  BYTE >C8,>00,>2F,>7A,>06,>4A,>C2,>DA  * 000006D8 ../z.J..
+  BYTE >04,>5B,>CE,>8B,>02,>00,>00,>00  * 000006E0 .[......
+  BYTE >D8,>00,>60,>00,>02,>00,>C2,>00  * 000006E8 ..`.....
+  BYTE >D8,>00,>60,>01,>02,>00,>00,>00  * 000006F0 ..`.....
+  BYTE >D8,>00,>60,>02,>02,>00,>0E,>00  * 000006F8 ..`.....
+  BYTE >D8,>00,>60,>03,>02,>00,>01,>00  * 00000700 ..`.....
+  BYTE >D8,>00,>60,>04,>02,>00,>06,>00  * 00000708 ..`.....
+  BYTE >D8,>00,>60,>05,>02,>00,>01,>00  * 00000710 ..`.....
+  BYTE >D8,>00,>60,>06,>02,>00,>F4,>00  * 00000718 ..`.....
+  BYTE >D8,>00,>60,>07,>02,>01,>D0,>00  * 00000720 ..`.....
+  BYTE >D8,>01,>03,>00,>02,>00,>03,>80  * 00000728 ........
+  BYTE >02,>01,>30,>C4,>02,>02,>00,>20  * 00000730 ..0.... 
+  BYTE >06,>A0,>2F,>6A,>02,>00,>00,>00  * 00000738 ../j....
+  BYTE >02,>01,>20,>00,>02,>02,>03,>00  * 00000740 .. .....
+  BYTE >06,>A0,>2F,>62,>02,>00,>08,>00  * 00000748 ../b....
+  BYTE >02,>01,>30,>E4,>02,>02,>00,>80  * 00000750 ..0.....
+  BYTE >06,>A0,>2F,>6A,>06,>4A,>C2,>DA  * 00000758 ../j.J..
+  BYTE >04,>5B,>DC,>01,>06,>02,>16,>FD  * 00000760 .[......
+  BYTE >04,>5B,>DC,>31,>06,>02,>16,>FD  * 00000768 .[.1....
+  BYTE >04,>5B,>DC,>70,>06,>02,>16,>FD  * 00000770 .[.p....
+  BYTE >04,>5B,>00,>00,>00,>00,>00,>00  * 00000778 .[......
+  BYTE >00,>00,>00,>00,>00,>00,>00,>00  * 00000780 ........
+  BYTE >00,>00,>00,>00,>00,>0C,>10,>00  * 00000788 ........
+  BYTE >80,>00,>00,>00,>00,>0C,>44,>53  * 00000790 ......DS
+  BYTE >4B,>31,>2E,>20,>20,>20,>20,>20  * 00000798 K1.     
+  BYTE >20,>20,>20,>20,>20,>00,>46,>31  * 000007A0      .F1
+  BYTE >38,>41,>20,>46,>69,>72,>6D,>77  * 000007A8 8A Firmw
+  BYTE >61,>72,>65,>20,>75,>70,>64,>61  * 000007B0 are upda
+  BYTE >74,>65,>20,>46,>6F,>75,>6E,>64  * 000007B8 te Found
+  BYTE >20,>46,>31,>38,>41,>3A,>20,>56  * 000007C0  F18A: V
+  BYTE >55,>70,>64,>61,>74,>65,>20,>66  * 000007C8 Update f
+  BYTE >69,>6C,>65,>3A,>20,>56,>50,>72  * 000007D0 ile: VPr
+  BYTE >65,>73,>73,>20,>50,>20,>74,>6F  * 000007D8 ess P to
+  BYTE >20,>70,>72,>6F,>63,>65,>65,>64  * 000007E0  proceed
+  BYTE >6F,>72,>20,>51,>20,>74,>6F,>20  * 000007E8 or Q to 
+  BYTE >71,>75,>69,>74,>2A,>20,>44,>4F  * 000007F0 quit* DO
+  BYTE >20,>4E,>4F,>54,>20,>54,>55,>52  * 000007F8  NOT TUR
+  BYTE >4E,>20,>4F,>46,>46,>20,>54,>48  * 00000800 N OFF TH
+  BYTE >45,>20,>50,>4F,>57,>45,>52,>20  * 00000808 E POWER 
+  BYTE >2A,>00,>3E,>3E,>3E,>20,>55,>50  * 00000810 *.>>> UP
+  BYTE >44,>41,>54,>45,>20,>43,>4F,>4D  * 00000818 DATE COM
+  BYTE >50,>4C,>45,>54,>45,>20,>3C,>3C  * 00000820 PLETE <<
+  BYTE >3C,>00,>50,>6F,>77,>65,>72,>20  * 00000828 <.Power 
+  BYTE >63,>79,>63,>6C,>65,>20,>79,>6F  * 00000830 cycle yo
+  BYTE >75,>72,>20,>73,>79,>73,>74,>65  * 00000838 ur syste
+  BYTE >6D,>00,>46,>49,>4C,>45,>20,>45  * 00000840 m.FILE E
+  BYTE >52,>52,>4F,>52,>20,>4E,>46,>49  * 00000848 RROR NFI
+  BYTE >4C,>45,>20,>4E,>4F,>54,>20,>46  * 00000850 LE NOT F
+  BYTE >4F,>55,>4E,>44,>20,>00,>46,>31  * 00000858 OUND .F1
+  BYTE >38,>41,>20,>4E,>4F,>54,>20,>44  * 00000860 8A NOT D
+  BYTE >45,>54,>45,>43,>54,>45,>44,>46  * 00000868 ETECTEDF
+  BYTE >49,>4C,>45,>20,>43,>52,>43,>20  * 00000870 ILE CRC 
+  BYTE >45,>52,>52,>4F,>52,>46,>4C,>41  * 00000878 ERRORFLA
+  BYTE >53,>48,>20,>56,>45,>52,>49,>46  * 00000880 SH VERIF
+  BYTE >59,>20,>45,>52,>52,>4F,>52,>21  * 00000888 Y ERROR!
+  BYTE >20,>44,>4F,>20,>4E,>4F,>54,>20  * 00000890  DO NOT 
+  BYTE >50,>4F,>57,>45,>52,>4F,>46,>46  * 00000898 POWEROFF
+  BYTE >2E,>20,>50,>52,>45,>53,>53,>20  * 000008A0 . PRESS 
+  BYTE >50,>20,>54,>4F,>20,>54,>52,>59  * 000008A8 P TO TRY
+  BYTE >20,>55,>50,>44,>41,>54,>45,>20  * 000008B0  UPDATE 
+  BYTE >41,>47,>41,>49,>4E,>00,>00,>01  * 000008B8 AGAIN...
+  BYTE >02,>00,>50,>51,>F0,>E0,>F0,>F0  * 000008C0 ..PQ....
+  BYTE >F0,>F0,>F0,>F0,>F0,>F0,>F0,>F0  * 000008C8 ........
+  BYTE >F0,>F0,>F0,>F0,>10,>10,>10,>10  * 000008D0 ........
+  BYTE >10,>10,>10,>10,>10,>10,>10,>10  * 000008D8 ........
+  BYTE >10,>10,>10,>10,>80,>80,>80,>80  * 000008E0 ........
+  BYTE >80,>80,>80,>80,>C0,>C0,>C0,>C0  * 000008E8 ........
+  BYTE >C0,>C0,>C0,>C0,>E0,>E0,>E0,>E0  * 000008F0 ........
+  BYTE >E0,>E0,>E0,>E0,>F0,>F0,>F0,>F0  * 000008F8 ........
+  BYTE >F0,>F0,>F0,>F0,>F8,>F8,>F8,>F8  * 00000900 ........
+  BYTE >F8,>F8,>F8,>F8,>FC,>FC,>FC,>FC  * 00000908 ........
+  BYTE >FC,>FC,>FC,>FC,>FE,>FE,>FE,>FE  * 00000910 ........
+  BYTE >FE,>FE,>FE,>FE,>FF,>FF,>FF,>FF  * 00000918 ........
+  BYTE >FF,>FF,>FF,>FF,>00,>00,>00,>00  * 00000920 ........
+  BYTE >0F,>08,>0B,>0A,>00,>00,>00,>00  * 00000928 ........
+  BYTE >FF,>00,>FF,>00,>00,>00,>00,>00  * 00000930 ........
+  BYTE >F0,>10,>D0,>50,>0A,>0B,>08,>0F  * 00000938 ...P....
+  BYTE >00,>00,>00,>00,>00,>FF,>00,>FF  * 00000940 ........
+  BYTE >00,>00,>00,>00,>50,>D0,>10,>F0  * 00000948 ....P...
+  BYTE >00,>00,>00,>00,>0A,>0A,>0A,>0A  * 00000950 ........
+  BYTE >0A,>0A,>0A,>0A,>50,>50,>50,>50  * 00000958 ....PPPP
+  BYTE >50,>50,>50,>50,>08,>09,>09,>09  * 00000960 PPPP....
+  BYTE >09,>09,>09,>09,>09,>09,>09,>09  * 00000968 ........
+  BYTE >09,>09,>09,>09,>09,>09,>09,>09  * 00000970 ........
+  BYTE >09,>09,>09,>09,>09,>09,>09,>09  * 00000978 ........
+  BYTE >09,>09,>09,>0A,>0E,>20,>20,>20  * 00000980 .....   
+  BYTE >20,>20,>20,>20,>20,>20,>20,>20  * 00000988         
+  BYTE >20,>20,>20,>20,>20,>20,>20,>20  * 00000990         
+  BYTE >20,>20,>20,>20,>20,>20,>20,>20  * 00000998         
+  BYTE >20,>20,>20,>0F,>0B,>0C,>0C,>0C  * 000009A0    .....
+  BYTE >0C,>0C,>0C,>0C,>0C,>0C,>0C,>0C  * 000009A8 ........
+  BYTE >0C,>0C,>0C,>0C,>0C,>0C,>0C,>0C  * 000009B0 ........
+  BYTE >0C,>0C,>0C,>0C,>0C,>0C,>0C,>0C  * 000009B8 ........
+  BYTE >0C,>0C,>0C,>0D,>46,>31,>38,>41  * 000009C0 ....F18A
+  BYTE >42,>49,>4E,>00,>46,>31,>38,>41  * 000009C8 BIN.F18A
+  BYTE >52,>4F,>4D,>00,>B9,>EE,>81,>AC  * 000009D0 ROM.....
+  BYTE >56,>97,>C0,>18,>AC,>BC,>ED,>A7  * 000009D8 V.......
+  BYTE >62,>39,>04,>CA,>F1,>69,>CE,>10  * 000009E0 b9...i..
+  BYTE >6C,>42,>61,>6B,>E9,>17,>64,>AC  * 000009E8 lBak..d.
+  BYTE >01,>86,>C7,>30,>3A,>68,>E2,>D7  * 000009F0 ...0:h..
+  BYTE >31,>C9,>C1,>85,>9D,>81,>CA,>03  * 000009F8 1.......
+  BYTE >A9,>20,>2F,>6E,>22,>96,>3F,>3B  * 00000A00 . /n".?;
+  BYTE >D7,>E9,>4A,>38,>E5,>09,>9B,>8E  * 00000A08 ..J8....
+  BYTE >56,>05,>7B,>25,>9D,>16,>DB,>4D  * 00000A10 V.{%...M
+  BYTE >0C,>02,>B0,>A7,>52,>23,>EE,>40  * 00000A18 ....R#.@
+  BYTE >E8,>2B,>33,>A2,>77,>C8,>62,>DA  * 00000A20 .+3.w.b.
+  BYTE >5C,>9E,>44,>99,>F0,>26,>19,>F6  * 00000A28 \.D..&..
+  BYTE >B4,>F4,>C2,>CF,>3A,>71,>DF,>12  * 00000A30 ....:q..
+  BYTE >6B,>C1,>7A,>59,>FB,>CD,>6A,>DD  * 00000A38 k.zY..j.
+  BYTE >8F,>4A,>F7,>25,>A2,>AC,>AD,>EF  * 00000A40 .J.%....
+  BYTE >FB,>91,>C0,>9F,>3C,>C7,>DC,>9F  * 00000A48 ....<...
+  BYTE >65,>22,>8C,>CD,>00,>00,>00,>00  * 00000A50 e"......
+  BYTE >7E,>EC,>59,>D4,>0B,>8E,>57,>29  * 00000A58 ~.Y...W)
+  BYTE >66,>68,>44,>77,>DC,>51,>CE,>4F  * 00000A60 fhDw.Q.O
+  BYTE >20,>CA,>00,>00,>E5,>A9,>97,>1F  * 00000A68  .......
+  BYTE >13,>45,>4A,>89,>E7,>BF,>FE,>48  * 00000A70 .EJ....H
+  BYTE >C0,>C7,>E6,>39,>9A,>ED,>29,>14  * 00000A78 ...9..).
+  BYTE >BA,>68,>04,>17,>FC,>80,>BF,>6C  * 00000A80 .h.....l
+  BYTE >CF,>A9,>F4,>3B,>CD,>62,>6D,>AA  * 00000A88 ...;.bm.
+  BYTE >F5,>3D,>1C,>0C,>65,>BB,>13,>C0  * 00000A90 .=..e...
+  BYTE >98,>2A,>73,>57,>3B,>93,>5A,>B5  * 00000A98 .*sW;.Z.
+  BYTE >D2,>96,>FA,>80,>26,>5C,>69,>E1  * 00000AA0 ....&\i.
+  BYTE >02,>0F,>27,>FE,>02,>04,>01,>C0  * 00000AA8 ..'.....
+  BYTE >C8,>04,>34,>C0,>02,>04,>34,>F2  * 00000AB0 ..4...4.
+  BYTE >02,>05,>00,>11,>0C,>A0,>34,>C4  * 00000AB8 ......4.
+  BYTE >02,>01,>0A,>00,>02,>02,>00,>06  * 00000AC0 ........
+  BYTE >0C,>A0,>35,>9A,>A8,>20,>34,>C2  * 00000AC8 ..5.. 4.
+  BYTE >34,>C0,>04,>5B,>A8,>20,>34,>C2  * 00000AD0 4..[. 4.
+  BYTE >34,>C0,>02,>04,>35,>56,>02,>05  * 00000AD8 4...5V..
+  BYTE >00,>0D,>0C,>A0,>34,>C4,>02,>01  * 00000AE0 ....4...
+  BYTE >0A,>00,>02,>02,>00,>06,>0C,>A0  * 00000AE8 ........
+  BYTE >35,>9A,>04,>5B,>C0,>20,>36,>44  * 00000AF0 5..[. 6D
+  BYTE >06,>00,>16,>07,>02,>09,>0A,>00  * 00000AF8 ........
+  BYTE >02,>04,>35,>04,>02,>05,>00,>14  * 00000B00 ..5.....
+  BYTE >10,>06,>02,>09,>0F,>00,>02,>04  * 00000B08 ........
+  BYTE >35,>18,>02,>05,>00,>0E,>0C,>A0  * 00000B10 5.......
+  BYTE >34,>C4,>0C,>A0,>34,>10,>C0,>00  * 00000B18 4...4...
+  BYTE >16,>10,>C0,>09,>02,>01,>00,>08  * 00000B20 ........
+  BYTE >C0,>A0,>36,>46,>38,>81,>A0,>03  * 00000B28 ..6F8...
+  BYTE >02,>01,>10,>00,>02,>02,>08,>00  * 00000B30 ........
+  BYTE >0C,>A0,>35,>CE,>02,>00,>00,>01  * 00000B38 ..5.....
+  BYTE >10,>02,>02,>00,>00,>02,>C8,>00  * 00000B40 ........
+  BYTE >36,>4A,>04,>5B,>0A,>00,>00,>00  * 00000B48 6J.[....
+  BYTE >06,>00,>A8,>20,>34,>C2,>34,>C0  * 00000B50 ... 4.4.
+  BYTE >02,>04,>34,>F2,>02,>05,>00,>11  * 00000B58 ..4.....
+  BYTE >0C,>A0,>34,>C4,>04,>C1,>02,>02  * 00000B60 ..4.....
+  BYTE >00,>06,>0C,>A0,>35,>9A,>A8,>20  * 00000B68 ....5.. 
+  BYTE >34,>C2,>34,>C0,>02,>04,>35,>26  * 00000B70 4.4...5&
+  BYTE >02,>05,>00,>0A,>0C,>A0,>34,>C4  * 00000B78 ......4.
+  BYTE >C0,>20,>33,>4C,>02,>01,>10,>00  * 00000B80 . 3L....
+  BYTE >02,>02,>01,>00,>0C,>A0,>36,>10  * 00000B88 ......6.
+  BYTE >C0,>20,>33,>4E,>02,>01,>10,>00  * 00000B90 . 3N....
+  BYTE >02,>02,>01,>00,>0C,>A0,>35,>CE  * 00000B98 ......5.
+  BYTE >05,>A0,>33,>4C,>05,>A0,>33,>4E  * 00000BA0 ..3L..3N
+  BYTE >06,>20,>33,>50,>16,>E9,>A8,>20  * 00000BA8 . 3P... 
+  BYTE >34,>C2,>34,>C0,>04,>5B,>C0,>20  * 00000BB0 4.4..[. 
+  BYTE >36,>44,>06,>00,>16,>06,>04,>C9  * 00000BB8 6D......
+  BYTE >02,>04,>35,>30,>02,>05,>00,>16  * 00000BC0 ..50....
+  BYTE >10,>06,>02,>09,>05,>00,>02,>04  * 00000BC8 ........
+  BYTE >35,>46,>02,>05,>00,>10,>0C,>A0  * 00000BD0 5F......
+  BYTE >34,>C4,>C0,>09,>02,>01,>00,>08  * 00000BD8 4.......
+  BYTE >C0,>A0,>36,>46,>38,>81,>A0,>03  * 00000BE0 ..6F8...
+  BYTE >02,>01,>10,>00,>02,>02,>08,>00  * 00000BE8 ........
+  BYTE >0C,>A0,>36,>10,>0C,>A0,>35,>68  * 00000BF0 ..6...5h
+  BYTE >0C,>A0,>34,>10,>C0,>00,>16,>03  * 00000BF8 ..4.....
+  BYTE >02,>00,>00,>01,>10,>02,>02,>00  * 00000C00 ........
+  BYTE >00,>02,>C8,>00,>36,>4A,>04,>5B  * 00000C08 ....6J.[
+  BYTE >02,>01,>10,>00,>02,>02,>08,>00  * 00000C10 ........
+  BYTE >0C,>A0,>34,>4E,>C0,>86,>02,>06  * 00000C18 ..4N....
+  BYTE >02,>81,>02,>01,>35,>64,>DD,>B1  * 00000C20 ....5d..
+  BYTE >DD,>B1,>DD,>B1,>DD,>B1,>0C,>A0  * 00000C28 ........
+  BYTE >35,>68,>80,>20,>36,>48,>13,>08  * 00000C30 5h. 6H..
+  BYTE >C0,>20,>36,>48,>02,>26,>00,>06  * 00000C38 . 6H.&..
+  BYTE >0C,>A0,>35,>68,>07,>00,>10,>01  * 00000C40 ..5h....
+  BYTE >04,>C0,>C1,>82,>0C,>00,>04,>C0  * 00000C48 ........
+  BYTE >04,>C4,>C0,>C0,>02,>43,>00,>0F  * 00000C50 .....C..
+  BYTE >0A,>13,>C1,>23,>34,>A0,>09,>40  * 00000C58 ...#4..@
+  BYTE >02,>40,>0F,>FF,>28,>04,>D0,>D1  * 00000C60 .@..(...
+  BYTE >06,>C3,>02,>43,>00,>0F,>0A,>13  * 00000C68 ...C....
+  BYTE >28,>23,>34,>A0,>C0,>C0,>02,>43  * 00000C70 (#4....C
+  BYTE >00,>0F,>0A,>13,>C1,>23,>34,>A0  * 00000C78 .....#4.
+  BYTE >09,>40,>02,>40,>0F,>FF,>28,>04  * 00000C80 .@.@..(.
+  BYTE >D0,>D1,>06,>C3,>09,>43,>02,>43  * 00000C88 .....C.C
+  BYTE >00,>0F,>0A,>13,>28,>23,>34,>A0  * 00000C90 ....(#4.
+  BYTE >05,>81,>06,>02,>16,>DA,>0C,>00  * 00000C98 ........
+  BYTE >00,>00,>CC,>01,>D8,>01,>14,>00  * 00000CA0 ........
+  BYTE >F0,>01,>3C,>00,>28,>00,>E4,>01  * 00000CA8 ..<.(...
+  BYTE >A0,>01,>6C,>00,>78,>00,>B4,>01  * 00000CB0 ..l.x...
+  BYTE >50,>00,>9C,>01,>88,>01,>44,>00  * 00000CB8 P.....D.
+  BYTE >01,>C0,>00,>20,>C1,>A0,>34,>C0  * 00000CC0 ... ..4.
+  BYTE >02,>07,>20,>20,>02,>08,>00,>10  * 00000CC8 ..  ....
+  BYTE >CD,>87,>06,>08,>16,>FD,>C1,>A0  * 00000CD0 ........
+  BYTE >34,>C0,>DD,>B4,>06,>05,>16,>FD  * 00000CD8 4.......
+  BYTE >0C,>00,>30,>31,>32,>33,>34,>35  * 00000CE0 ..012345
+  BYTE >36,>37,>38,>39,>41,>42,>43,>44  * 00000CE8 6789ABCD
+  BYTE >45,>46,>43,>6C,>65,>61,>72,>69  * 00000CF0 EFCleari
+  BYTE >6E,>67,>20,>73,>65,>63,>74,>6F  * 00000CF8 ng secto
+  BYTE >72,>3A,>20,>11,>53,>74,>61,>67  * 00000D00 r: .Stag
+  BYTE >69,>6E,>67,>20,>62,>69,>74,>20  * 00000D08 ing bit 
+  BYTE >73,>74,>72,>65,>61,>6D,>3A,>20  * 00000D10 stream: 
+  BYTE >53,>74,>61,>67,>69,>6E,>67,>20  * 00000D18 Staging 
+  BYTE >64,>61,>74,>61,>3A,>20,>55,>50  * 00000D20 data: UP
+  BYTE >44,>41,>54,>49,>4E,>47,>3A,>20  * 00000D28 DATING: 
+  BYTE >56,>65,>72,>69,>66,>79,>69,>6E  * 00000D30 Verifyin
+  BYTE >67,>20,>62,>69,>74,>20,>73,>74  * 00000D38 g bit st
+  BYTE >72,>65,>61,>6D,>3A,>20,>56,>65  * 00000D40 ream: Ve
+  BYTE >72,>69,>66,>79,>69,>6E,>67,>20  * 00000D48 rifying 
+  BYTE >64,>61,>74,>61,>3A,>20,>43,>6C  * 00000D50 data: Cl
+  BYTE >65,>61,>6E,>69,>6E,>67,>20,>75  * 00000D58 eaning u
+  BYTE >70,>3A,>20,>0D,>43,>52,>43,>3A  * 00000D60 p: .CRC:
+  BYTE >C1,>C6,>C2,>00,>08,>C8,>02,>48  * 00000D68 .......H
+  BYTE >00,>0F,>DD,>E8,>34,>E2,>C2,>00  * 00000D70 ....4...
+  BYTE >08,>88,>02,>48,>00,>0F,>DD,>E8  * 00000D78 ...H....
+  BYTE >34,>E2,>C2,>00,>08,>48,>02,>48  * 00000D80 4....H.H
+  BYTE >00,>0F,>DD,>E8,>34,>E2,>C2,>00  * 00000D88 ....4...
+  BYTE >02,>48,>00,>0F,>DD,>E8,>34,>E2  * 00000D90 .H....4.
+  BYTE >0C,>00,>02,>03,>06,>00,>03,>A0  * 00000D98 ........
+  BYTE >32,>03,>03,>C0,>02,>03,>D8,>00  * 00000DA0 2.......
+  BYTE >03,>A0,>32,>03,>32,>01,>04,>C0  * 00000DA8 ..2.2...
+  BYTE >32,>00,>32,>00,>03,>C0,>04,>C3  * 00000DB0 2.2.....
+  BYTE >C0,>C1,>06,>C3,>DD,>A3,>34,>E2  * 00000DB8 ......4.
+  BYTE >0C,>A0,>36,>30,>02,>21,>01,>00  * 00000DC0 ..60.!..
+  BYTE >06,>02,>16,>E7,>0C,>00,>0C,>A0  * 00000DC8 ........
+  BYTE >35,>68,>02,>03,>06,>00,>03,>A0  * 00000DD0 5h......
+  BYTE >32,>03,>03,>C0,>02,>03,>02,>00  * 00000DD8 2.......
+  BYTE >03,>A0,>32,>03,>32,>00,>06,>C0  * 00000DE0 ..2.2...
+  BYTE >32,>00,>06,>C0,>04,>C3,>32,>03  * 00000DE8 2.....2.
+  BYTE >02,>03,>01,>00,>32,>31,>06,>02  * 00000DF0 ....21..
+  BYTE >13,>02,>06,>03,>16,>FB,>03,>C0  * 00000DF8 ........
+  BYTE >05,>C6,>0C,>A0,>36,>30,>06,>46  * 00000E00 ....60.F
+  BYTE >05,>80,>C0,>82,>16,>E0,>0C,>00  * 00000E08 ........
+  BYTE >02,>03,>0B,>00,>03,>A0,>32,>03  * 00000E10 ......2.
+  BYTE >32,>00,>06,>C0,>32,>00,>06,>C0  * 00000E18 2...2...
+  BYTE >04,>C3,>32,>03,>36,>03,>36,>31  * 00000E20 ..2.6.61
+  BYTE >06,>02,>16,>FD,>03,>C0,>0C,>00  * 00000E28 ........
+  BYTE >02,>03,>05,>00,>03,>A0,>32,>03  * 00000E30 ......2.
+  BYTE >36,>03,>02,>43,>01,>00,>16,>FC  * 00000E38 6..C....
+  BYTE >03,>C0,>0C,>00,>00,>00,>00,>00  * 00000E40 ........
+  BYTE >00,>00,>00,>00                  * 00000E48 ....
+
+
+* Size of data in above array
+SIZE_OF_GPUDAT EQU 3660
+
+*-------------------------------------------------------------------
+
+       END

@@ -1,0 +1,47 @@
+
+Create 99/4A In-System Update Files
+
+Files:
+
+F18AUpdate_CF7.dsk - CF7 disk image for final update program and data files
+F18AUpdate.TIDisk - used by assembler for the final object code of the update executable
+F18A_update.apf - Win99 assembler project file
+F18A_update.a99 - main update source code
+F18AUPD - update program as a raw file on a filesystem
+F18ABIN - final update program as a raw file on a filesystem
+F18AROM - final update data file as a raw file on a filesystem
+
+* Copy .bit (not .bin) from systhesis to firmware update working directory.
+
+* Run CRC.jar and select the .bit file to get CRC data for the update program.
+  This will create an assembly file with DATA statements.
+
+* Copy DATA from generated CRC into the updater assembly program at label: FL1CRC
+
+* Change the data at the label FRMVER to match the new version.
+
+* Repeat CRC steps if the data file has changes from the previous update.
+
+* Use TI99Dir to copy the .bit file and DATA file to the file system as TI files:
+  - Select the .bit file
+  - Tools->Convert PC to TI file
+      TI File name: F18ABIN (or F18AROM for the DATA file)
+      File Type: INT/FIX
+      Record Len: 128
+      Text/Data Conversion: Binary (no conversion)
+
+* Assemble the program, copy .obj, F18ABIN, and F18AROM to a Classic99 disk directory.
+  Run Classic99 and stop after the CRC test to get the new CRC value.
+
+* Put the CRC value into the program code and reassemble.
+
+* Run in Classic99 data to verify the main update screen appears.  If Classic99 resets
+  to the master title screen, the CRC failed.
+
+* Check the new version number.
+
+* Using TI99Dir:
+  - Open the CF7 image and delete the old files (F18AROM, F18AUPD, F18ABIN)
+  - Copy the new F18AROM, F18AUPD, F18ABIN to the CF7 image, the F18AUPD file will
+    come from the F18AUpdate.TIDisk image file.
+  - Copy F18AUpdate_CF7.dsk image to a CF7 card
