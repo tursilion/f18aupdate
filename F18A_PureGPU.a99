@@ -504,8 +504,7 @@ CALLBK MOV  R11,*R10+           * Push return address onto the stack
        MOV  *R1,@GPUCRC					* CRC checksum
        CLR  @GPURES             * Clear result
 *      Call GPU routine
-			 LI   R0,GPUCPY						* System crashes if this is BL @GPUCPY on HW only. WHY?
-       BL   @DO_GPU							* original code did this inline
+       BL   @GPUCPY							* XXX This crashes - not sure at exactly what point
 			 MOV  @GPURES,R1
        CI   R1,>0001            * Check for success
        JEQ  CALLB2
