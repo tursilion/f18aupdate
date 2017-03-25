@@ -44,8 +44,6 @@ VDPWD  EQU  >8C00               * VDP write data
 VDPWA  EQU  >8C02               * VDP set read/write address
 KEYDEV EQU  >8374               * Keyboard device
 KEY    EQU  >8375               * Key pressed
-STATUS EQU  >837C               * Key status
-FNPNTR EQU  >8356               * File name pointer
 SCAN   EQU  >000E               * ROM keyboard scan vector
 
 *      VDP Memory Map
@@ -73,8 +71,7 @@ R0LB   EQU  WRKSP+1             * R0 low byte reqd for VDP routines
 R5LB   EQU  WRKSP+11            * R5 low byte used for PAB erorrs
 PABCOD EQU  WRKSP+24            * code space, overwrite R12 onward
 F18A   EQU  PABCOD+16           * F18A detected
-F18VER EQU  F18A+2              * F18A version
-STACK  EQU  F18VER+2
+STACK  EQU  F18A+2
 
 *      Start address of host-side code
        AORG >6000
@@ -410,20 +407,6 @@ F18ADT MOV  R11,*R10+           * Push return address onto the stack
        CLR  @F18A
        JMP  F18ADE
 F18AOK SETO @F18A
-*      Get the version number
-       LI   R0,>0F0E            * Choose version status reg
-       BL   @VWTR
-       CLR  R0
-       MOVB @VDPSTA,R0
-       MOV  R0,R1
-       ANDI R0,>F000
-       SRL  R0,4                * MSB - major version no
-       ANDI R1,>0F00
-       SRL  R1,8
-       SOC  R1,R0               * LSB - minor version no
-       MOV  R0,@F18VER
-       LI   R0,>0F00            * Choose ordinary status reg
-       BL   @VWTR
 F18ADE DECT R10                 * Pop return address off the stack
        MOV  *R10,R11
        B    *R11
