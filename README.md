@@ -5,7 +5,7 @@ This is a port of the original code by Matt Hagerty and AsmusR to run entirely o
 
 The goal was to create a version which is easier to port to other systems - the result of that with C code can be found [here](https://github.com/tursilion/f18aupdatecoleco)
 
-Download the latest release zip here: [F18A_GPUUpdate8.bin](F18A_GPUUpdate8.bin)
+Download the latest release here: [F18A_GPUUpdate8.bin](F18A_GPUUpdate8.bin)
 
 This is a 256k "non-inverted" bank-switched ROM. To use this 256k file on a 512k ROM board, simply duplicate it to create a 512k file.
 
