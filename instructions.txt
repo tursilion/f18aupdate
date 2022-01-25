@@ -11,6 +11,8 @@ F18AUPD - update program as a raw file on a filesystem
 F18ABIN - final update program as a raw file on a filesystem
 F18AROM - final update data file as a raw file on a filesystem
 
+* File changes go to both F18A_PureGPU.a99 and F18A_update.a99
+
 * Copy .bit (not .bin) from systhesis to firmware update working directory.
 
 * Run CRC.jar and select the .bit file to get CRC data for the update program.
@@ -20,7 +22,9 @@ F18AROM - final update data file as a raw file on a filesystem
 
 * Change the data at the label FRMVER to match the new version.
 
-* Repeat CRC steps if the data file has changes from the previous update.
+* Change the text at F18UPD to read 'BETA' or 'F18A', depending on program
+
+* Repeat CRC steps if the data file has changes from the previous update (to FL2CRC). This is not common.
 
 * Use TI99Dir to copy the .bit file and DATA file to the file system as TI files:
   - Select the .bit file
@@ -29,11 +33,12 @@ F18AROM - final update data file as a raw file on a filesystem
       File Type: INT/FIX
       Record Len: 128
       Text/Data Conversion: Binary (no conversion)
+  - (note: if you are using a Classic99 FIAD, no conversion is needed for IF128 after ver 399.005)      
 
-* Assemble the program, copy .obj, F18ABIN, and F18AROM to a Classic99 disk directory.
+* Assemble F18A_update.a99, copy .obj, F18ABIN, and F18AROM to a Classic99 disk directory.
   Run Classic99 and stop after the CRC test to get the new CRC value.
 
-* Put the CRC value into the program code and reassemble.
+* Put the CRC value (from R1) into the program code at 'CHKSUM' and reassemble.
 
 * Run in Classic99 data to verify the main update screen appears.  If Classic99 resets
   to the master title screen, the CRC failed.

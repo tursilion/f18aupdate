@@ -1274,13 +1274,14 @@ CPUEND
 
 *      Start address in VRAM of CPU code
        AORG GPUPRG
-GSTART
+* GSTART needs to go on the first line of code so my checksum code has
+* an address to work with.
 
 **
 * Clear high end SPI Flash sectors for a temp buffer
 * Sectors 10 - 15 or >0A0000 to >0F0000
 GPUINI
-       LI   R15,GPUPRG-2      * Set up the stack pointer
+GSTART LI   R15,GPUPRG-2      * Set up the stack pointer
 
        LI   R4,14*32+0+NAMETB * Initialize the last line for display output
        MOV  R4,@LASTLN
